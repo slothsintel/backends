@@ -9,14 +9,8 @@ async def merge_autotrac(
     incomes_csv: UploadFile = File(...),
     time_entries_csv: UploadFile = File(...),
 ):
-    # Basic content-type sanity (browsers may send application/vnd.ms-excel for csv)
     for f in (projects_csv, incomes_csv, time_entries_csv):
         if not f.filename.lower().endswith(".csv"):
-            raise HTTPException(status_code=400, detail=f"Expected CSV file, got: {f.filename}")
+            raise HTTPException(status_code=400, detail=f"Expected .csv file, got: {f.filename}")
 
-    result = await merge_autotrac_exports(
-        projects_csv=projects_csv,
-        incomes_csv=incomes_csv,
-        time_entries_csv=time_entries_csv,
-    )
-    return result
+    return await merge_autotrac_exports(projects_csv, incomes_csv, time_entries_csv)
