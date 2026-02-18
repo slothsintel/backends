@@ -207,6 +207,6 @@ async def trim_aggregate_and_join(
     return {
         "mode": "trim_agg_full_join_dedup",
         "stats": stats,
-        "preview_csv": _preview(merged, 25),
+        "preview_csv": _preview(merged, 10),
         "download_csv": merged.to_csv(index=False),
     }
