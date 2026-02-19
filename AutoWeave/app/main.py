@@ -2,6 +2,8 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .api import router as api_router
+from sqlalchemy import text
+from app.db import engine
 
 app = FastAPI(title="AutoWeave API", version="0.1.0")
 
@@ -35,3 +37,9 @@ def health():
     return {"ok": True}
 
 app.include_router(api_router, prefix="/api/v1")
+
+@app.get("/health/db")
+def health_db():
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
+    return {"ok": True}

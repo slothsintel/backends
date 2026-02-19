@@ -2,3 +2,7 @@ fastapi==0.115.6
 uvicorn[standard]==0.32.1
 python-multipart==0.0.12
 pandas==2.2.3
+SQLAlchemy>=2.0
+alembic>=1.13
+psycopg2-binary>=2.9
+python-dotenv>=1.0
