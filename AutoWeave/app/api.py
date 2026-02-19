@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import secrets
 import smtplib
+import socket
 from email.message import EmailMessage
 from datetime import datetime, timedelta
 from typing import Optional
@@ -46,13 +47,21 @@ def send_email(to_email: str, subject: str, text_body: str) -> None:
     msg["To"] = to_email
     msg.set_content(text_body)
 
-    with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as s:
+    # Force IPv4 to avoid "Network is unreachable" when IPv6 route is broken
+    addrinfos = socket.getaddrinfo(smtp_host, smtp_port, socket.AF_INET, socket.SOCK_STREAM)
+    if not addrinfos:
+        raise RuntimeError(f"No IPv4 address found for SMTP host: {smtp_host}")
+
+    # getaddrinfo returns (family, socktype, proto, canonname, sockaddr)
+    _family, _socktype, _proto, _canonname, sockaddr = addrinfos[0]
+    host_v4, port_v4 = sockaddr[0], sockaddr[1]
+
+    with smtplib.SMTP(host_v4, port_v4, timeout=20) as s:
         s.ehlo()
         s.starttls()
         s.ehlo()
         s.login(smtp_user, smtp_pass)
         s.send_message(msg)
-
 
 def _make_verify_link(email: str, token: str) -> str:
     # route back to your static tech workbench
