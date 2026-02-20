@@ -1,356 +1,325 @@
-from __future__ import annotations
-
 import os
 import secrets
+import hashlib
 import smtplib
-import socket
-from email.message import EmailMessage
-from datetime import datetime, timedelta
+from email.mime.text import MIMEText
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr
-from sqlalchemy.orm import Session
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
-from .services.merge import trim_aggregate_and_join
 from .db import get_db
-from .models import OwUser, OwPasswordReset
-from .auth import hash_password, verify_password, create_access_token
+from .models import User, PasswordReset
+from .auth import (
+    hash_password,
+    verify_password,
+    create_access_token,
+    decode_access_token,
+)
 
 router = APIRouter()
 
-PUBLIC_APP_URL = (os.getenv("PUBLIC_APP_URL") or "https://autoweave.slothsintel.com").rstrip("/")
-VERIFY_TTL_HOURS = int(os.getenv("VERIFY_TTL_HOURS", "48"))
+# ----- config -----
+FRONTEND_URL = os.getenv("FRONTEND_URL", "").rstrip("/")
+PUBLIC_APP_URL = os.getenv("PUBLIC_APP_URL", FRONTEND_URL).rstrip("/")
+SECRET_KEY = os.getenv("SECRET_KEY", "")
+JWT_SECRET = os.getenv("JWT_SECRET", SECRET_KEY)
+
+EMAIL_FROM = os.getenv("EMAIL_FROM", os.getenv("SMTP_USER", "")).strip()
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+
+VERIFY_TTL_HOURS = int(os.getenv("VERIFY_TTL_HOURS", "24"))
 RESET_TTL_HOURS = int(os.getenv("RESET_TTL_HOURS", "2"))
 
 
-# -------------------------
-# SMTP helper (AutoTrac style env vars)
-# -------------------------
+def utcnow() -> datetime:
+    """Timezone-aware UTC 'now'. Avoid naive/aware datetime comparison bugs."""
+    return datetime.now(timezone.utc)
 
-def send_email(to_email: str, subject: str, text_body: str) -> None:
-    smtp_host = (os.getenv("SMTP_HOST") or "").strip()
-    smtp_port = int(os.getenv("SMTP_PORT") or "587")
-    smtp_user = (os.getenv("SMTP_USER") or "").strip()
-    smtp_pass = (os.getenv("SMTP_PASS") or "").strip()
 
-    email_from = (os.getenv("EMAIL_FROM") or smtp_user).strip()
-    from_name = (os.getenv("EMAIL_FROM_NAME") or "Sloths Intel").strip()
+def to_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """Coerce a datetime from DB into timezone-aware UTC."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
-    if not (smtp_host and smtp_user and smtp_pass and email_from):
-        raise RuntimeError("SMTP env vars not fully set (SMTP_HOST/PORT/USER/PASS, EMAIL_FROM).")
 
-    msg = EmailMessage()
+# ----- helpers -----
+def _send_email(to_email: str, subject: str, body: str) -> None:
+    if not (SMTP_HOST and SMTP_USER and SMTP_PASS and EMAIL_FROM):
+        raise RuntimeError("SMTP is not configured (SMTP_HOST/USER/PASS/EMAIL_FROM).")
+
+    msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = subject
-    msg["From"] = f"{from_name} <{email_from}>"
+    msg["From"] = EMAIL_FROM
     msg["To"] = to_email
-    msg.set_content(text_body)
 
-    # Force IPv4 to avoid "Network is unreachable" when IPv6 route is broken
-    addrinfos = socket.getaddrinfo(smtp_host, smtp_port, socket.AF_INET, socket.SOCK_STREAM)
-    if not addrinfos:
-        raise RuntimeError(f"No IPv4 address found for SMTP host: {smtp_host}")
-
-    # getaddrinfo returns (family, socktype, proto, canonname, sockaddr)
-    _family, _socktype, _proto, _canonname, sockaddr = addrinfos[0]
-    host_v4, port_v4 = sockaddr[0], sockaddr[1]
-
-    with smtplib.SMTP(host_v4, port_v4, timeout=20) as s:
-        s.ehlo()
-        s.starttls()
-        s.ehlo()
-        s.login(smtp_user, smtp_pass)
-        s.send_message(msg)
-
-def _make_verify_link(email: str, token: str) -> str:
-    # route back to your static tech workbench
-    return f"{PUBLIC_APP_URL}/tech.html?mode=verify&email={email}&token={token}#workbench"
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+        server.ehlo()
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.sendmail(EMAIL_FROM, [to_email], msg.as_string())
 
 
-def _make_reset_link(email: str, token: str) -> str:
-    return f"{PUBLIC_APP_URL}/tech.html?mode=reset&email={email}&token={token}#workbench"
+def _new_token() -> str:
+    return secrets.token_urlsafe(32)
 
 
-def _user_has_inline_tokens(user: OwUser) -> bool:
-    return all(hasattr(user, k) for k in ("verify_token_hash", "verify_expires_at", "reset_token_hash", "reset_expires_at"))
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-# -------------------------
-# Schemas
-# -------------------------
+def _verify_link(email: str, token: str) -> str:
+    # front-end consumes: tech.html?mode=verify&email=...&token=...
+    base = PUBLIC_APP_URL or FRONTEND_URL
+    return f"{base}/tech.html?mode=verify&email={email}&token={token}#workbench"
 
-class RegisterRequest(BaseModel):
+
+def _reset_link(email: str, token: str) -> str:
+    base = PUBLIC_APP_URL or FRONTEND_URL
+    return f"{base}/tech.html?mode=reset&email={email}&token={token}#workbench"
+
+
+# ----- schemas -----
+class RegisterIn(BaseModel):
     email: EmailStr
     password: str
 
 
-class LoginRequest(BaseModel):
+class LoginIn(BaseModel):
     email: EmailStr
     password: str
 
 
-class ForgotRequest(BaseModel):
+class ResendVerifyIn(BaseModel):
     email: EmailStr
 
 
-class VerifyRequest(BaseModel):
+class ForgotIn(BaseModel):
+    email: EmailStr
+
+
+class VerifyIn(BaseModel):
     email: EmailStr
     token: str
 
 
-class ResetRequest(BaseModel):
+class ResetIn(BaseModel):
     email: EmailStr
     token: str
     new_password: str
 
 
-# -------------------------
-# Auth endpoints
-# -------------------------
-
+# ----- routes -----
 @router.post("/auth/register")
-def register(data: RegisterRequest, db: Session = Depends(get_db)):
-    email = data.email.strip().lower()
-    password = data.password or ""
+def register(data: RegisterIn, db: Session = Depends(get_db)):
+    email = data.email.lower().strip()
 
-    if len(password) < 8:
-        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
-
-    existing = db.execute(select(OwUser).where(OwUser.email == email)).scalar_one_or_none()
+    existing = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
     if existing:
-        raise HTTPException(status_code=400, detail="Email already registered")
+        raise HTTPException(status_code=400, detail="Email already registered.")
 
-    user = OwUser(
+    raw_token = _new_token()
+    vhash = _hash_token(raw_token)
+    vexp = utcnow() + timedelta(hours=VERIFY_TTL_HOURS)
+
+    user = User(
         email=email,
-        password_hash=hash_password(password),
-        is_email_verified=False,
+        password_hash=hash_password(data.password),
+        is_verified=False,
+        verify_hash=vhash,
+        verify_expires_at=vexp,
+        created_at=utcnow(),
+        updated_at=utcnow(),
     )
-
-    # generate verification token
-    raw_verify = secrets.token_urlsafe(32)
-    if _user_has_inline_tokens(user):
-        user.verify_token_hash = hash_password(raw_verify)          # type: ignore[attr-defined]
-        user.verify_expires_at = datetime.utcnow() + timedelta(hours=VERIFY_TTL_HOURS)  # type: ignore[attr-defined]
-
     db.add(user)
     db.commit()
 
-    # send verification email (log failures instead of breaking registration)
+    # send verify
     try:
-        link = _make_verify_link(email, raw_verify)
-        subject = "Confirm your AutoWeave account"
-        body = (
-            "Welcome to AutoWeave!\n\n"
-            "Please confirm your email address:\n"
-            f"{link}\n\n"
-            f"This link expires in {VERIFY_TTL_HOURS} hours.\n\n"
-            "If you didn’t create an account, ignore this email.\n\n"
-            "— Sloths Intel\n"
+        link = _verify_link(email, raw_token)
+        _send_email(
+            email,
+            "Verify your AutoWeave account",
+            f"Welcome to AutoWeave.\n\nVerify your email:\n{link}\n\nThis link expires in {VERIFY_TTL_HOURS} hours.",
         )
-        send_email(email, subject, body)
     except Exception as e:
-        print("EMAIL_SEND_FAILED(register):", repr(e))
+        # keep account created; user can resend
+        print(f"EMAIL_SEND_FAILED(register): {repr(e)}")
 
-    return {"ok": True}
-
-
-@router.post("/auth/resend-verify")
-def resend_verify(data: ForgotRequest, db: Session = Depends(get_db)):
-    """
-    Resend verification email. Always returns ok=True (no account enumeration).
-    """
-    email = data.email.strip().lower()
-
-    user = db.execute(select(OwUser).where(OwUser.email == email)).scalar_one_or_none()
-    if not user:
-        return {"ok": True}
-
-    if getattr(user, "is_email_verified", False):
-        return {"ok": True}
-
-    raw_verify = secrets.token_urlsafe(32)
-    if _user_has_inline_tokens(user):
-        user.verify_token_hash = hash_password(raw_verify)          # type: ignore[attr-defined]
-        user.verify_expires_at = datetime.utcnow() + timedelta(hours=VERIFY_TTL_HOURS)  # type: ignore[attr-defined]
-        db.commit()
-    else:
-        # If your model doesn't have inline token columns yet, you MUST add them;
-        # otherwise you can't verify users via token.
-        print("WARN: ow_users missing verify_* columns; cannot resend verify token.")
-        return {"ok": True}
-
-    try:
-        link = _make_verify_link(email, raw_verify)
-        subject = "Your AutoWeave verification link"
-        body = (
-            "Here is your AutoWeave verification link:\n\n"
-            f"{link}\n\n"
-            f"This link expires in {VERIFY_TTL_HOURS} hours.\n\n"
-            "— Sloths Intel\n"
-        )
-        send_email(email, subject, body)
-    except Exception as e:
-        print("EMAIL_SEND_FAILED(resend_verify):", repr(e))
-
-    return {"ok": True}
-
-
-@router.post("/auth/verify")
-def verify_email(data: VerifyRequest, db: Session = Depends(get_db)):
-    email = data.email.strip().lower()
-    token = (data.token or "").strip()
-    now = datetime.utcnow()
-
-    user = db.execute(select(OwUser).where(OwUser.email == email)).scalar_one_or_none()
-    if not user:
-        raise HTTPException(status_code=400, detail="Invalid verification token")
-
-    if getattr(user, "is_email_verified", False):
-        return {"ok": True}
-
-    if not _user_has_inline_tokens(user):
-        raise HTTPException(status_code=500, detail="Server missing verify token fields (run migration).")
-
-    vhash = user.verify_token_hash  # type: ignore[attr-defined]
-    vexp = user.verify_expires_at   # type: ignore[attr-defined]
-
-    if (not vhash) or (not vexp) or (vexp <= now):
-        raise HTTPException(status_code=400, detail="Invalid verification token")
-
-    if not verify_password(token, vhash):
-        raise HTTPException(status_code=400, detail="Invalid verification token")
-
-    user.is_email_verified = True
-    user.verify_token_hash = None  # type: ignore[attr-defined]
-    user.verify_expires_at = None  # type: ignore[attr-defined]
-    db.commit()
-
-    return {"ok": True}
+    return {"ok": True, "message": "Registered. Verification email sent (if possible)."}
 
 
 @router.post("/auth/login")
-def login(data: LoginRequest, db: Session = Depends(get_db)):
-    email = data.email.strip().lower()
-    password = data.password or ""
+def login(data: LoginIn, db: Session = Depends(get_db)):
+    email = data.email.lower().strip()
+    user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
 
-    user = db.execute(select(OwUser).where(OwUser.email == email)).scalar_one_or_none()
-    if (not user) or (not verify_password(password, user.password_hash)):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+    if (not user) or (not verify_password(data.password, user.password_hash)):
+        raise HTTPException(status_code=401, detail="Invalid credentials.")
 
-    if not getattr(user, "is_email_verified", False):
-        raise HTTPException(status_code=403, detail="Please verify your email before logging in")
+    if not user.is_verified:
+        raise HTTPException(status_code=403, detail="Email not verified.")
 
-    token = create_access_token(str(user.id))
+    token = create_access_token({"sub": str(user.id), "email": user.email})
     return {"access_token": token, "token_type": "bearer"}
 
 
+@router.post("/auth/resend-verify")
+def resend_verify(data: ResendVerifyIn, db: Session = Depends(get_db)):
+    email = data.email.lower().strip()
+    user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
+
+    # Always return OK (avoid account enumeration)
+    if not user or user.is_verified:
+        return {"ok": True, "message": "If that email exists, a verification link has been sent."}
+
+    raw_token = _new_token()
+    user.verify_hash = _hash_token(raw_token)
+    user.verify_expires_at = utcnow() + timedelta(hours=VERIFY_TTL_HOURS)
+    user.updated_at = utcnow()
+    db.commit()
+
+    try:
+        link = _verify_link(email, raw_token)
+        _send_email(
+            email,
+            "Your AutoWeave verification link",
+            f"Verify your email:\n{link}\n\nThis link expires in {VERIFY_TTL_HOURS} hours.",
+        )
+    except Exception as e:
+        print(f"EMAIL_SEND_FAILED(resend_verify): {repr(e)}")
+
+    return {"ok": True, "message": "If that email exists, a verification link has been sent."}
+
+
+@router.post("/auth/verify")
+def verify_email(data: VerifyIn, db: Session = Depends(get_db)):
+    email = data.email.lower().strip()
+    token = data.token.strip()
+
+    now = utcnow()
+
+    user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=400, detail="Invalid verification request.")
+
+    vhash = user.verify_hash
+    vexp = to_utc(user.verify_expires_at)
+
+    if (not vhash) or (not vexp) or (vexp <= now):
+        raise HTTPException(status_code=400, detail="Verification link expired. Please resend.")
+
+    if _hash_token(token) != vhash:
+        raise HTTPException(status_code=400, detail="Invalid verification token.")
+
+    user.is_verified = True
+    user.verify_hash = None
+    user.verify_expires_at = None
+    user.updated_at = utcnow()
+    db.commit()
+
+    return {"ok": True, "message": "Email verified."}
+
+
 @router.post("/auth/forgot")
-def forgot(data: ForgotRequest, db: Session = Depends(get_db)):
-    """
-    Always ok=True. If user exists, creates reset token and emails link.
-    """
-    email = data.email.strip().lower()
-    user = db.execute(select(OwUser).where(OwUser.email == email)).scalar_one_or_none()
+def forgot_password(data: ForgotIn, db: Session = Depends(get_db)):
+    email = data.email.lower().strip()
+    user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
 
-    if user:
-        raw_reset = secrets.token_urlsafe(32)
-        expires = datetime.utcnow() + timedelta(hours=RESET_TTL_HOURS)
+    # Always return OK (avoid account enumeration)
+    if not user:
+        return {"ok": True, "message": "If that email exists, a reset link has been sent."}
 
-        if _user_has_inline_tokens(user):
-            user.reset_token_hash = hash_password(raw_reset)  # type: ignore[attr-defined]
-            user.reset_expires_at = expires                    # type: ignore[attr-defined]
-            db.commit()
-        else:
-            # fallback table
-            reset = OwPasswordReset(
-                user_id=user.id,
-                token_hash=hash_password(raw_reset),
-                expires_at=expires,
-            )
-            db.add(reset)
-            db.commit()
+    raw_token = _new_token()
+    token_hash = _hash_token(raw_token)
+    expires_at = utcnow() + timedelta(hours=RESET_TTL_HOURS)
 
-        try:
-            link = _make_reset_link(email, raw_reset)
-            subject = "Reset your AutoWeave password"
-            body = (
-                "We received a request to reset your AutoWeave password.\n\n"
-                "Use this link to set a new password:\n"
-                f"{link}\n\n"
-                f"This link expires in {RESET_TTL_HOURS} hours.\n\n"
-                "If you didn’t request this, ignore this email.\n\n"
-                "— Sloths Intel\n"
-            )
-            send_email(email, subject, body)
-        except Exception as e:
-            print("EMAIL_SEND_FAILED(forgot):", repr(e))
+    reset = PasswordReset(
+        user_id=user.id,
+        token_hash=token_hash,
+        expires_at=expires_at,
+        used_at=None,
+        created_at=utcnow(),
+    )
+    db.add(reset)
+    db.commit()
 
-    return {"ok": True}
+    try:
+        link = _reset_link(email, raw_token)
+        _send_email(
+            email,
+            "Reset your AutoWeave password",
+            f"Reset your password:\n{link}\n\nThis link expires in {RESET_TTL_HOURS} hours.",
+        )
+    except Exception as e:
+        print(f"EMAIL_SEND_FAILED(forgot): {repr(e)}")
+
+    return {"ok": True, "message": "If that email exists, a reset link has been sent."}
 
 
 @router.post("/auth/reset")
-def reset_password(data: ResetRequest, db: Session = Depends(get_db)):
-    email = data.email.strip().lower()
-    token = (data.token or "").strip()
-    new_password = data.new_password or ""
-    now = datetime.utcnow()
+def reset_password(data: ResetIn, db: Session = Depends(get_db)):
+    email = data.email.lower().strip()
+    token = data.token.strip()
+    now = utcnow()
 
-    if len(new_password) < 8:
-        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
-
-    user = db.execute(select(OwUser).where(OwUser.email == email)).scalar_one_or_none()
+    user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
     if not user:
-        raise HTTPException(status_code=400, detail="Invalid reset token")
+        raise HTTPException(status_code=400, detail="Invalid reset request.")
 
-    # inline tokens preferred
-    if _user_has_inline_tokens(user):
-        rhash = user.reset_token_hash   # type: ignore[attr-defined]
-        rexp = user.reset_expires_at    # type: ignore[attr-defined]
-        if (not rhash) or (not rexp) or (rexp <= now):
-            raise HTTPException(status_code=400, detail="Invalid reset token")
-        if not verify_password(token, rhash):
-            raise HTTPException(status_code=400, detail="Invalid reset token")
+    token_hash = _hash_token(token)
 
-        user.password_hash = hash_password(new_password)
-        user.reset_token_hash = None    # type: ignore[attr-defined]
-        user.reset_expires_at = None    # type: ignore[attr-defined]
-        db.commit()
-        return {"ok": True}
+    reset = (
+        db.execute(
+            select(PasswordReset)
+            .where(PasswordReset.user_id == user.id)
+            .where(PasswordReset.token_hash == token_hash)
+            .order_by(PasswordReset.created_at.desc())
+        )
+        .scalars()
+        .first()
+    )
 
-    # fallback: ow_password_resets
-    reset = db.execute(
-        select(OwPasswordReset)
-        .join(OwUser, OwPasswordReset.user_id == OwUser.id)
-        .where(OwUser.email == email)
-        .order_by(OwPasswordReset.created_at.desc())
-    ).scalars().first()
+    if not reset:
+        raise HTTPException(status_code=400, detail="Invalid reset token.")
 
-    if (not reset) or reset.used_at or (reset.expires_at <= now):
-        raise HTTPException(status_code=400, detail="Invalid reset token")
+    exp = to_utc(reset.expires_at)
+    if reset.used_at or (not exp) or (exp <= now):
+        raise HTTPException(status_code=400, detail="Reset link expired. Please request a new one.")
 
-    if not verify_password(token, reset.token_hash):
-        raise HTTPException(status_code=400, detail="Invalid reset token")
+    user.password_hash = hash_password(data.new_password)
+    user.updated_at = utcnow()
 
-    user.password_hash = hash_password(new_password)
-    reset.used_at = now
+    reset.used_at = utcnow()
     db.commit()
-    return {"ok": True}
+
+    return {"ok": True, "message": "Password updated."}
 
 
-# -------------------------
-# Merge endpoint
-# -------------------------
+@router.get("/auth/me")
+def me(request: Request, db: Session = Depends(get_db)):
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing token.")
+    token = auth.split(" ", 1)[1].strip()
 
-@router.post("/merge/autotrac")
-async def merge_autotrac(
-    time_entries_csv: UploadFile = File(...),
-    incomes_csv: UploadFile = File(...),
-    projects_csv: UploadFile | None = File(None),
-):
-    files = [time_entries_csv, incomes_csv] + ([projects_csv] if projects_csv else [])
-    for f in files:
-        if not f.filename.lower().endswith(".csv"):
-            raise HTTPException(status_code=400, detail=f"Expected .csv file, got: {f.filename}")
+    payload = decode_access_token(token)
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid token.")
 
-    return await trim_aggregate_and_join(time_entries_csv, incomes_csv, projects_csv)
+    user = db.execute(select(User).where(User.id == int(user_id))).scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid token.")
+
+    return {"id": user.id, "email": user.email, "is_verified": user.is_verified}
