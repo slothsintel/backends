@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import os
 
 from .api import router as api_router
+from .db import ensure_schema
 
 def _split_origins(val: str) -> list[str]:
     return [o.strip() for o in (val or "").split(",") if o.strip()]
@@ -11,6 +12,10 @@ ALLOWED_ORIGINS = _split_origins(os.getenv("ALLOWED_ORIGINS", ""))
 
 app = FastAPI(title="AutoWeave API")
 
+@app.on_event("startup")
+def _startup():
+    ensure_schema()
+    
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS else ["*"],

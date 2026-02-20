@@ -1,34 +1,43 @@
-from sqlalchemy import String, Boolean, DateTime, Text
-from sqlalchemy.orm import Mapped, mapped_column
-from datetime import datetime
+# app/models.py
+from datetime import datetime, timezone
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey
+from sqlalchemy.orm import relationship
 from .db import Base
+
+
+def utcnow():
+    return datetime.now(timezone.utc)
+
 
 class OwUser(Base):
     __tablename__ = "ow_users"
 
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, unique=True, index=True, nullable=False)
+    password_hash = Column(String, nullable=False)
 
-    password_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    # IMPORTANT: keep name as is_verified to match what your API currently expects
+    is_verified = Column(Boolean, nullable=False, default=False)
 
-    is_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    verify_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
-    verify_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    verify_hash = Column(String, nullable=True)
+    verify_expires_at = Column(DateTime(timezone=True), nullable=True)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    reset_hash = Column(String, nullable=True)
+    reset_expires_at = Column(DateTime(timezone=True), nullable=True)
+
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
 
 class OwPasswordReset(Base):
     __tablename__ = "ow_password_resets"
 
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    email: Mapped[str] = mapped_column(String(255), index=True, nullable=False)
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("ow_users.id", ondelete="CASCADE"), nullable=False)
 
-    reset_hash: Mapped[str] = mapped_column(Text, nullable=False)
-    reset_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    token_hash = Column(String, nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    used_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-
-# Backward-compat aliases (prevents ImportError like "cannot import name User")
-User = OwUser
-PasswordReset = OwPasswordReset
+    user = relationship("OwUser")
