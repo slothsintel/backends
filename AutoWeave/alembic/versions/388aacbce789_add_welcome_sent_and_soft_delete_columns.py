@@ -1,0 +1,23 @@
+"""add welcome_sent and soft delete columns
+
+Revision ID: 388aacbce789
+Revises: 0002_ow_users_tokens
+Create Date: 2026-02-20 15:27:09.895734
+
+"""
+from typing import Sequence, Union
+
+from alembic import op
+import sqlalchemy as sa
+
+def upgrade():
+    op.add_column("ow_users", sa.Column("welcome_sent", sa.Boolean(), nullable=False, server_default=sa.text("false")))
+    op.add_column("ow_users", sa.Column("welcome_sent_at", sa.DateTime(timezone=True), nullable=True))
+    op.add_column("ow_users", sa.Column("is_deleted", sa.Boolean(), nullable=False, server_default=sa.text("false")))
+    op.add_column("ow_users", sa.Column("deleted_at", sa.DateTime(timezone=True), nullable=True))
+
+def downgrade():
+    op.drop_column("ow_users", "deleted_at")
+    op.drop_column("ow_users", "is_deleted")
+    op.drop_column("ow_users", "welcome_sent_at")
+    op.drop_column("ow_users", "welcome_sent")
