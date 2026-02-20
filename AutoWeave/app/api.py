@@ -106,6 +106,42 @@ def build_reset_link(email: str, token: str) -> str:
 
 
 # ------------------------
+# Email content
+# ------------------------
+def send_welcome_email(to_email: str):
+    """
+    Welcome letter sent after successful verification.
+    Keep it plain-text for now to match your mailer.py.
+    """
+    base = frontend_url()
+    start_link = f"{base}/tech.html#guided" if base else ""
+
+    body = f"""
+Welcome to AutoWeave 🎉
+
+Your email is verified and your account is ready.
+
+What you can do next:
+1) Upload your CSVs (projects / income / time entries) securely from the dashboard
+2) Run merge
+3) Preview stats + charts
+4) Export a clean dataset
+
+{("Start here: " + start_link) if start_link else ""}
+
+If you need help, just reply to this email.
+
+— Sloths Intel Team
+""".strip()
+
+    send_email(
+        to_email=to_email,
+        subject="AutoWeave – Welcome aboard",
+        text_body=body,
+    )
+
+
+# ------------------------
 # Endpoints
 # ------------------------
 @router.post("/register")
@@ -141,8 +177,20 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
     if link:
         send_email(
             to_email=user.email,
-            subject="Verify your email",
-            text_body=f"Click to verify: {link}\n\nIf you didn't request this, ignore this email.",
+            subject="AutoWeave – Verify Your Email",
+            text_body=f"""
+Welcome to AutoWeave 👋
+
+Please verify your email by clicking the link below:
+
+{link}
+
+This link will expire in 24 hours.
+
+If you did not create this account, you can safely ignore this email.
+
+— Sloths Intel
+""".strip(),
         )
 
     return {"ok": True}
@@ -189,8 +237,20 @@ def resend_verify(payload: EmailOnly, db: Session = Depends(get_db)):
     if link:
         send_email(
             to_email=user.email,
-            subject="Verify your email",
-            text_body=f"Click to verify: {link}\n\nIf you didn't request this, ignore this email.",
+            subject="AutoWeave – Verify Your Email",
+            text_body=f"""
+Welcome back 👋
+
+Please verify your email by clicking the link below:
+
+{link}
+
+This link will expire in 24 hours.
+
+If you did not request this email, you can safely ignore it.
+
+— Sloths Intel
+""".strip(),
         )
 
     return {"ok": True}
@@ -200,6 +260,7 @@ def resend_verify(payload: EmailOnly, db: Session = Depends(get_db)):
 def verify_email(payload: VerifyRequest, db: Session = Depends(get_db)):
     """
     Confirm verification token.
+    Sends a welcome email the first time verification succeeds (no DB migration).
     """
     email = payload.email.lower().strip()
     token = payload.token.strip()
@@ -210,18 +271,32 @@ def verify_email(payload: VerifyRequest, db: Session = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=400, detail="Invalid token")
 
+    # If already verified, we can return OK without sending welcome again
+    # (prevents spamming if frontend retries).
+    if user.is_verified:
+        return {"ok": True}
+
     vhash = user.verify_hash
     vexp = user.verify_expires_at
 
     if (not vhash) or (not vexp) or (vexp <= now) or (vhash != token_hash):
         raise HTTPException(status_code=400, detail="Invalid or expired token")
 
+    # Mark verified
     user.is_verified = True
     user.verify_hash = None
     user.verify_expires_at = None
     user.updated_at = now
     db.add(user)
     db.commit()
+
+    # Send welcome email after successful verification
+    # (done after commit so the account is definitely verified even if email fails)
+    try:
+        send_welcome_email(user.email)
+    except Exception:
+        # Don't fail verification if SMTP hiccups
+        pass
 
     return {"ok": True}
 
@@ -261,8 +336,20 @@ def forgot_password(payload: ForgotRequest, db: Session = Depends(get_db)):
     if link:
         send_email(
             to_email=user.email,
-            subject="Reset your password",
-            text_body=f"Reset link: {link}\n\nIf you didn't request this, ignore this email.",
+            subject="AutoWeave – Password Reset",
+            text_body=f"""
+We received a request to reset your AutoWeave password.
+
+Click the link below to set a new password:
+
+{link}
+
+This link will expire in 2 hours.
+
+If you did not request this, please ignore this email.
+
+— Sloths Intel
+""".strip(),
         )
 
     return {"ok": True}

@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey
 from sqlalchemy.orm import relationship
 from .db import Base
+from sqlalchemy import Boolean, DateTime
 
 
 def utcnow():
@@ -27,6 +28,9 @@ class OwUser(Base):
 
     created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
     updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+    welcome_sent = Column(Boolean, nullable=False, default=False)
+    welcome_sent_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class OwPasswordReset(Base):
