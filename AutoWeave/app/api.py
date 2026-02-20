@@ -4,7 +4,7 @@ import secrets
 import hashlib
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Header
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 
@@ -13,11 +13,10 @@ from passlib.context import CryptContext
 from .db import get_db
 from .models import OwUser, OwPasswordReset
 from .mailer import send_email
-from .auth import create_access_token
+from .auth import create_access_token, safe_decode_sub
 
-# IMPORTANT:
 # main.py mounts this router at prefix="/api/v1"
-# so this router should be prefix="/auth" -> final URLs: /api/v1/auth/...
+# final URLs: /api/v1/auth/...
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
@@ -39,6 +38,34 @@ def new_token_urlsafe(nbytes: int = 24) -> str:
 def frontend_url() -> str:
     # prefer your explicit FRONTEND_URL; fallback to PUBLIC_APP_URL
     return (os.getenv("FRONTEND_URL") or os.getenv("PUBLIC_APP_URL") or "").rstrip("/")
+
+
+def _require_bearer_token(authorization: str | None) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing token")
+    return authorization.split(" ", 1)[1].strip()
+
+
+def _require_current_user(db: Session, authorization: str | None) -> OwUser:
+    token = _require_bearer_token(authorization)
+    sub = safe_decode_sub(token)
+    if not sub:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    try:
+        user_id = int(sub)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    user = db.query(OwUser).filter(OwUser.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    # If you later add soft-delete fields to the model, this will work automatically
+    if getattr(user, "is_deleted", False):
+        raise HTTPException(status_code=403, detail="Account deleted")
+
+    return user
 
 
 # ------------------------
@@ -73,8 +100,13 @@ class ResetPasswordRequest(BaseModel):
     new_password: str
 
 
+class DeleteAccountRequest(BaseModel):
+    password: str
+    confirm: str  # must be "DELETE"
+
+
 # ------------------------
-# Password hashing
+# Password hashing (PBKDF2 avoids bcrypt 72-byte limit + bcrypt backend issues)
 # ------------------------
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 
@@ -94,7 +126,6 @@ def build_verify_link(email: str, token: str) -> str:
     base = frontend_url()
     if not base:
         return ""
-    # Keep consistent with your frontend router/anchor
     return f"{base}/tech.html?mode=verify&email={email}&token={token}#workbench"
 
 
@@ -109,10 +140,6 @@ def build_reset_link(email: str, token: str) -> str:
 # Email content
 # ------------------------
 def send_welcome_email(to_email: str):
-    """
-    Welcome letter sent after successful verification.
-    Keep it plain-text for now to match your mailer.py.
-    """
     base = frontend_url()
     start_link = f"{base}/tech.html#guided" if base else ""
 
@@ -131,7 +158,7 @@ What you can do next:
 
 If you need help, just reply to this email.
 
-— Sloths Intel Team
+— Sloths Intel
 """.strip()
 
     send_email(
@@ -146,9 +173,6 @@ If you need help, just reply to this email.
 # ------------------------
 @router.post("/register")
 def register(payload: RegisterRequest, db: Session = Depends(get_db)):
-    """
-    Create account + send verification email.
-    """
     email = payload.email.lower().strip()
     pw = payload.password
 
@@ -189,7 +213,7 @@ This link will expire in 24 hours.
 
 If you did not create this account, you can safely ignore this email.
 
-— Sloths Intel
+— Sloths Intel Team
 """.strip(),
         )
 
@@ -198,13 +222,16 @@ If you did not create this account, you can safely ignore this email.
 
 @router.post("/login")
 def login(payload: LoginRequest, db: Session = Depends(get_db)):
-    """
-    Login requires verified email. Returns JWT access token.
-    """
     email = payload.email.lower().strip()
     user = db.query(OwUser).filter(OwUser.email == email).first()
 
-    if (not user) or (not verify_password(payload.password, user.password_hash)):
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    if getattr(user, "is_deleted", False):
+        raise HTTPException(status_code=403, detail="Account deleted")
+
+    if not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     if not user.is_verified:
@@ -216,14 +243,11 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
 
 @router.post("/resend-verify")
 def resend_verify(payload: EmailOnly, db: Session = Depends(get_db)):
-    """
-    Re-issue verification email if user exists and is not verified.
-    Always returns 200 to avoid leaking whether a user exists.
-    """
     email = payload.email.lower().strip()
     user = db.query(OwUser).filter(OwUser.email == email).first()
 
-    if not user or user.is_verified:
+    # Always 200 (don’t leak whether user exists)
+    if not user or getattr(user, "is_deleted", False) or user.is_verified:
         return {"ok": True}
 
     token = new_token_urlsafe()
@@ -249,7 +273,7 @@ This link will expire in 24 hours.
 
 If you did not request this email, you can safely ignore it.
 
-— Sloths Intel
+— Sloths Intel Team
 """.strip(),
         )
 
@@ -258,21 +282,16 @@ If you did not request this email, you can safely ignore it.
 
 @router.post("/verify")
 def verify_email(payload: VerifyRequest, db: Session = Depends(get_db)):
-    """
-    Confirm verification token.
-    Sends a welcome email the first time verification succeeds (no DB migration).
-    """
     email = payload.email.lower().strip()
     token = payload.token.strip()
     token_hash = sha256_hex(token)
     now = utcnow()
 
     user = db.query(OwUser).filter(OwUser.email == email).first()
-    if not user:
+    if not user or getattr(user, "is_deleted", False):
         raise HTTPException(status_code=400, detail="Invalid token")
 
-    # If already verified, we can return OK without sending welcome again
-    # (prevents spamming if frontend retries).
+    # If already verified, do not re-send welcome
     if user.is_verified:
         return {"ok": True}
 
@@ -282,7 +301,6 @@ def verify_email(payload: VerifyRequest, db: Session = Depends(get_db)):
     if (not vhash) or (not vexp) or (vexp <= now) or (vhash != token_hash):
         raise HTTPException(status_code=400, detail="Invalid or expired token")
 
-    # Mark verified
     user.is_verified = True
     user.verify_hash = None
     user.verify_expires_at = None
@@ -290,12 +308,10 @@ def verify_email(payload: VerifyRequest, db: Session = Depends(get_db)):
     db.add(user)
     db.commit()
 
-    # Send welcome email after successful verification
-    # (done after commit so the account is definitely verified even if email fails)
+    # Send welcome email after successful verification (SMTP failure won't block verify)
     try:
         send_welcome_email(user.email)
     except Exception:
-        # Don't fail verification if SMTP hiccups
         pass
 
     return {"ok": True}
@@ -303,14 +319,11 @@ def verify_email(payload: VerifyRequest, db: Session = Depends(get_db)):
 
 @router.post("/forgot")
 def forgot_password(payload: ForgotRequest, db: Session = Depends(get_db)):
-    """
-    Send reset link if account exists.
-    Always returns 200 to avoid leaking whether a user exists.
-    """
     email = payload.email.lower().strip()
     user = db.query(OwUser).filter(OwUser.email == email).first()
 
-    if not user:
+    # Always 200 (don’t leak)
+    if not user or getattr(user, "is_deleted", False):
         return {"ok": True}
 
     token = new_token_urlsafe()
@@ -348,7 +361,7 @@ This link will expire in 2 hours.
 
 If you did not request this, please ignore this email.
 
-— Sloths Intel
+— Sloths Intel Team
 """.strip(),
         )
 
@@ -357,15 +370,12 @@ If you did not request this, please ignore this email.
 
 @router.post("/reset")
 def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db)):
-    """
-    Reset password using email + token (sent via /forgot).
-    """
     email = payload.email.lower().strip()
     token = payload.token.strip()
     now = utcnow()
 
     user = db.query(OwUser).filter(OwUser.email == email).first()
-    if not user:
+    if not user or getattr(user, "is_deleted", False):
         raise HTTPException(status_code=400, detail="Invalid or expired token")
 
     token_hash = sha256_hex(token)
@@ -401,5 +411,55 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db))
         pr.used_at = now
         db.add(pr)
 
+    db.commit()
+    return {"ok": True}
+
+
+@router.post("/delete-account")
+def delete_account(
+    payload: DeleteAccountRequest,
+    db: Session = Depends(get_db),
+    authorization: str | None = Header(None),
+):
+    """
+    Let a logged-in user delete their own account.
+
+    Safety measures:
+    - Requires Bearer token (logged in)
+    - Requires password re-check (prevents stolen-token deletion)
+    - Requires typing confirm="DELETE"
+
+    Default behavior:
+    - Soft-delete if your OwUser model has (is_deleted, deleted_at)
+    - Otherwise, hard-delete the user row (and reset audit rows)
+    """
+    user = _require_current_user(db, authorization)
+
+    if payload.confirm.strip().upper() != "DELETE":
+        raise HTTPException(status_code=400, detail='Type "DELETE" to confirm')
+
+    if not verify_password(payload.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid password")
+
+    now = utcnow()
+
+    # Clear any active tokens (good hygiene)
+    user.verify_hash = None
+    user.verify_expires_at = None
+    user.reset_hash = None
+    user.reset_expires_at = None
+
+    # Prefer soft-delete if columns exist; otherwise hard-delete
+    if hasattr(user, "is_deleted") and hasattr(user, "deleted_at"):
+        user.is_deleted = True
+        user.deleted_at = now
+        user.updated_at = now
+        db.add(user)
+        db.commit()
+        return {"ok": True}
+
+    # Hard delete fallback
+    db.query(OwPasswordReset).filter(OwPasswordReset.user_id == user.id).delete()
+    db.delete(user)
     db.commit()
     return {"ok": True}

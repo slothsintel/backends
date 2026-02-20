@@ -1,5 +1,7 @@
 # app/models.py
 from datetime import datetime, timezone
+
+from zmq import NULL
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey
 from sqlalchemy.orm import relationship
 from .db import Base
@@ -31,6 +33,9 @@ class OwUser(Base):
 
     welcome_sent = Column(Boolean, nullable=False, default=False)
     welcome_sent_at = Column(DateTime(timezone=True), nullable=True)
+
+    is_deleted = Column(Boolean, nullable=False, default=False)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class OwPasswordReset(Base):
