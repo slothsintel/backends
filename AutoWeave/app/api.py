@@ -16,9 +16,10 @@ from .models import OwUser, OwPasswordReset
 from .mailer import send_email
 from .auth import create_access_token, safe_decode_sub
 
-# main.py mounts this router at prefix="/api/v1"
-# so this router must be prefix="/auth" -> final URLs: /api/v1/auth/...
-router = APIRouter(prefix="/auth", tags=["auth"])
+# If main.py DOES NOT add a /api/v1 prefix, keep this:
+router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
+# If main.py ALREADY mounts /api/v1, use instead:
+# router = APIRouter(prefix="/auth", tags=["auth"])
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 
@@ -39,7 +40,6 @@ def new_token_urlsafe(nbytes: int = 24) -> str:
 
 
 def frontend_url() -> str:
-    # prefer explicit FRONTEND_URL; fallback to PUBLIC_APP_URL
     return (os.getenv("FRONTEND_URL") or os.getenv("PUBLIC_APP_URL") or "").rstrip("/")
 
 
@@ -140,6 +140,7 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
 
     link = build_verify_link(user.email, token)
     if link:
+        # Your mailer.py likely expects text_body (NOT text)
         send_email(
             to_email=user.email,
             subject="AutoWeave – Verify your email",
@@ -202,17 +203,16 @@ def verify_email(payload: VerifyRequest, db: Session = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=400, detail="Invalid or expired token")
 
-    vhash = user.verify_hash
-    vexp = user.verify_expires_at
+    if (not user.verify_hash) or (not user.verify_expires_at):
+        raise HTTPException(status_code=400, detail="Invalid or expired token")
 
-    if (not vhash) or (not vexp) or (vexp <= now) or (vhash != token_hash):
+    if user.verify_expires_at <= now or user.verify_hash != token_hash:
         raise HTTPException(status_code=400, detail="Invalid or expired token")
 
     user.is_verified = True
     user.verify_hash = None
     user.verify_expires_at = None
     user.updated_at = now
-
     db.add(user)
     db.commit()
 
@@ -228,7 +228,6 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
-    # soft delete support (if your model has these fields)
     if getattr(user, "is_deleted", False):
         raise HTTPException(status_code=401, detail="Account is deleted")
 
@@ -238,7 +237,9 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     if not user.is_verified:
         raise HTTPException(status_code=401, detail="Email not verified")
 
-    token = create_access_token(str(user.id))  # IMPORTANT: sub=user.id
+    # IMPORTANT: sub is user.id (string)
+    token = create_access_token(str(user.id))
+
     user.updated_at = utcnow()
     db.add(user)
     db.commit()
@@ -313,7 +314,10 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db))
     now = utcnow()
     token_hash = sha256_hex(token)
 
-    if (not user.reset_hash) or (not user.reset_expires_at) or (user.reset_expires_at <= now) or (user.reset_hash != token_hash):
+    if (not user.reset_hash) or (not user.reset_expires_at):
+        raise HTTPException(status_code=400, detail="Invalid or expired token")
+
+    if user.reset_expires_at <= now or user.reset_hash != token_hash:
         raise HTTPException(status_code=400, detail="Invalid or expired token")
 
     user.password_hash = hash_password(new_pw)
@@ -334,13 +338,13 @@ def delete_account(
 ):
     """
     Soft-delete current user.
-    IMPORTANT: token sub is user.id (string), not email.
+    FIX: JWT sub is user.id, so we must query by id.
     """
     sub = safe_decode_sub(token)
     if not sub:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    # sub is user.id
+    # If your OwUser.id is UUID, remove int() and query by string.
     try:
         user_id = int(sub)
     except Exception:
@@ -356,11 +360,11 @@ def delete_account(
     if not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid password")
 
-    # Soft delete if fields exist; otherwise hard delete
+    # soft delete if fields exist, else hard delete
     if hasattr(user, "is_deleted"):
-        setattr(user, "is_deleted", True)
+        user.is_deleted = True
         if hasattr(user, "deleted_at"):
-            setattr(user, "deleted_at", utcnow())
+            user.deleted_at = utcnow()
         user.updated_at = utcnow()
         db.add(user)
         db.commit()
