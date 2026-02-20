@@ -1,51 +1,38 @@
 import os
 import secrets
-import hashlib
+import logging
 import smtplib
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, EmailStr
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 
 from .db import get_db
-from .models import User, PasswordReset
+from .models import OwUser, OwPasswordReset
 from .auth import (
     hash_password,
     verify_password,
     create_access_token,
-    decode_access_token,
+    decode_token,
+    token_hash,
+    verify_token_hash,
 )
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
-
-# ----- config -----
-FRONTEND_URL = os.getenv("FRONTEND_URL", "").rstrip("/")
-PUBLIC_APP_URL = os.getenv("PUBLIC_APP_URL", FRONTEND_URL).rstrip("/")
-SECRET_KEY = os.getenv("SECRET_KEY", "")
-JWT_SECRET = os.getenv("JWT_SECRET", SECRET_KEY)
-
-EMAIL_FROM = os.getenv("EMAIL_FROM", os.getenv("SMTP_USER", "")).strip()
-SMTP_HOST = os.getenv("SMTP_HOST", "")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASS = os.getenv("SMTP_PASS", "")
-
-VERIFY_TTL_HOURS = int(os.getenv("VERIFY_TTL_HOURS", "24"))
-RESET_TTL_HOURS = int(os.getenv("RESET_TTL_HOURS", "2"))
 
 
 def utcnow() -> datetime:
-    """Timezone-aware UTC 'now'. Avoid naive/aware datetime comparison bugs."""
+    """Timezone-aware UTC now."""
     return datetime.now(timezone.utc)
 
 
-def to_utc(dt: Optional[datetime]) -> Optional[datetime]:
-    """Coerce a datetime from DB into timezone-aware UTC."""
+def ensure_utc(dt: datetime | None) -> datetime | None:
+    """Ensure datetime is timezone-aware UTC (handles naive values safely)."""
     if dt is None:
         return None
     if dt.tzinfo is None:
@@ -53,43 +40,73 @@ def to_utc(dt: Optional[datetime]) -> Optional[datetime]:
     return dt.astimezone(timezone.utc)
 
 
-# ----- helpers -----
-def _send_email(to_email: str, subject: str, body: str) -> None:
-    if not (SMTP_HOST and SMTP_USER and SMTP_PASS and EMAIL_FROM):
-        raise RuntimeError("SMTP is not configured (SMTP_HOST/USER/PASS/EMAIL_FROM).")
+# -------------------------
+# Config
+# -------------------------
+ENV = os.getenv("ENV", "development")
 
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = subject
+JWT_SECRET = os.getenv("JWT_SECRET", os.getenv("SECRET_KEY", "dev-secret"))
+JWT_EXPIRES_MINUTES = int(os.getenv("JWT_EXPIRES_MINUTES", "60"))
+
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5500")
+PUBLIC_APP_URL = os.getenv("PUBLIC_APP_URL", FRONTEND_URL)
+
+EMAIL_FROM = os.getenv("EMAIL_FROM", "no-reply@example.com")
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+
+VERIFY_TOKEN_TTL_MIN = int(os.getenv("VERIFY_TOKEN_TTL_MIN", "60"))
+RESET_TOKEN_TTL_MIN = int(os.getenv("RESET_TOKEN_TTL_MIN", "30"))
+
+
+# -------------------------
+# Helpers
+# -------------------------
+def _send_email(to_email: str, subject: str, html_body: str):
+    """Send email via SMTP (Gmail app password supported)."""
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
+        raise RuntimeError("SMTP is not configured (missing SMTP_HOST/USER/PASS).")
+
+    msg = MIMEMultipart("alternative")
     msg["From"] = EMAIL_FROM
     msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.attach(MIMEText(html_body, "html"))
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+    # Gmail: STARTTLS on 587
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
         server.ehlo()
-        server.starttls()
+        if SMTP_PORT in (587, 25):
+            server.starttls()
+            server.ehlo()
         server.login(SMTP_USER, SMTP_PASS)
         server.sendmail(EMAIL_FROM, [to_email], msg.as_string())
 
 
-def _new_token() -> str:
-    return secrets.token_urlsafe(32)
+def _make_verify_email_link(email: str, token: str) -> str:
+    return f"{PUBLIC_APP_URL}/tech.html?mode=verify&email={email}&token={token}#workbench"
 
 
-def _hash_token(token: str) -> str:
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+def _make_reset_email_link(email: str, token: str) -> str:
+    return f"{PUBLIC_APP_URL}/tech.html?mode=reset&email={email}&token={token}#workbench"
 
 
-def _verify_link(email: str, token: str) -> str:
-    # front-end consumes: tech.html?mode=verify&email=...&token=...
-    base = PUBLIC_APP_URL or FRONTEND_URL
-    return f"{base}/tech.html?mode=verify&email={email}&token={token}#workbench"
+def _user_has_inline_reset_tokens() -> bool:
+    """
+    If OwUser has reset_token_hash/reset_expires_at columns (inline reset),
+    prefer that path; otherwise fallback to OwPasswordReset table.
+    """
+    return hasattr(OwUser, "reset_token_hash") and hasattr(OwUser, "reset_expires_at")
 
 
-def _reset_link(email: str, token: str) -> str:
-    base = PUBLIC_APP_URL or FRONTEND_URL
-    return f"{base}/tech.html?mode=reset&email={email}&token={token}#workbench"
+# -------------------------
+# Schemas (Pydantic)
+# -------------------------
+from pydantic import BaseModel, EmailStr
 
 
-# ----- schemas -----
 class RegisterIn(BaseModel):
     email: EmailStr
     password: str
@@ -104,222 +121,253 @@ class ResendVerifyIn(BaseModel):
     email: EmailStr
 
 
-class ForgotIn(BaseModel):
-    email: EmailStr
-
-
 class VerifyIn(BaseModel):
     email: EmailStr
     token: str
 
 
-class ResetIn(BaseModel):
+class ForgotIn(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordIn(BaseModel):
     email: EmailStr
     token: str
     new_password: str
 
 
-# ----- routes -----
+# -------------------------
+# Routes
+# -------------------------
 @router.post("/auth/register")
-def register(data: RegisterIn, db: Session = Depends(get_db)):
-    email = data.email.lower().strip()
+def register(payload: RegisterIn, db: Session = Depends(get_db)):
+    email = payload.email.strip().lower()
+    password = payload.password
 
-    existing = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
+    existing = db.query(OwUser).filter(OwUser.email == email).first()
     if existing:
-        raise HTTPException(status_code=400, detail="Email already registered.")
+        raise HTTPException(status_code=400, detail="Email already registered")
 
-    raw_token = _new_token()
-    vhash = _hash_token(raw_token)
-    vexp = utcnow() + timedelta(hours=VERIFY_TTL_HOURS)
+    verify_token = secrets.token_urlsafe(32)
+    now = utcnow()
+    expires = now + timedelta(minutes=VERIFY_TOKEN_TTL_MIN)
 
-    user = User(
+    user = OwUser(
         email=email,
-        password_hash=hash_password(data.password),
-        is_verified=False,
-        verify_hash=vhash,
-        verify_expires_at=vexp,
-        created_at=utcnow(),
-        updated_at=utcnow(),
+        hashed_password=hash_password(password),
+        is_email_verified=False,
+        verify_token_hash=token_hash(verify_token),
+        verify_expires_at=expires,
+        created_at=now,
+        updated_at=now,
     )
     db.add(user)
     db.commit()
 
-    # send verify
-    try:
-        link = _verify_link(email, raw_token)
-        _send_email(
-            email,
-            "Verify your AutoWeave account",
-            f"Welcome to AutoWeave.\n\nVerify your email:\n{link}\n\nThis link expires in {VERIFY_TTL_HOURS} hours.",
-        )
-    except Exception as e:
-        # keep account created; user can resend
-        print(f"EMAIL_SEND_FAILED(register): {repr(e)}")
+    link = _make_verify_email_link(email, verify_token)
+    subject = "Verify your email"
+    body = f"""
+    <p>Hi,</p>
+    <p>Please verify your email by clicking the link below:</p>
+    <p><a href="{link}">Verify email</a></p>
+    <p>This link expires in {VERIFY_TOKEN_TTL_MIN} minutes.</p>
+    """
 
-    return {"ok": True, "message": "Registered. Verification email sent (if possible)."}
+    try:
+        _send_email(email, subject, body)
+    except Exception as e:
+        logger.exception("EMAIL_SEND_FAILED(register): %s", e)
+
+    return {"ok": True}
 
 
 @router.post("/auth/login")
-def login(data: LoginIn, db: Session = Depends(get_db)):
-    email = data.email.lower().strip()
-    user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
+def login(payload: LoginIn, db: Session = Depends(get_db)):
+    email = payload.email.strip().lower()
+    user = db.query(OwUser).filter(OwUser.email == email).first()
+    if not user or not verify_password(payload.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    if (not user) or (not verify_password(data.password, user.password_hash)):
-        raise HTTPException(status_code=401, detail="Invalid credentials.")
+    # Require verified email
+    if not user.is_email_verified:
+        raise HTTPException(status_code=403, detail="Email not verified")
 
-    if not user.is_verified:
-        raise HTTPException(status_code=403, detail="Email not verified.")
-
-    token = create_access_token({"sub": str(user.id), "email": user.email})
+    token = create_access_token({"sub": str(user.id), "email": user.email}, JWT_SECRET, JWT_EXPIRES_MINUTES)
     return {"access_token": token, "token_type": "bearer"}
 
 
 @router.post("/auth/resend-verify")
-def resend_verify(data: ResendVerifyIn, db: Session = Depends(get_db)):
-    email = data.email.lower().strip()
-    user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
+def resend_verify(payload: ResendVerifyIn, db: Session = Depends(get_db)):
+    email = payload.email.strip().lower()
+    user = db.query(OwUser).filter(OwUser.email == email).first()
 
-    # Always return OK (avoid account enumeration)
-    if not user or user.is_verified:
-        return {"ok": True, "message": "If that email exists, a verification link has been sent."}
+    # Always respond OK to avoid email enumeration
+    if not user or user.is_email_verified:
+        return {"ok": True}
 
-    raw_token = _new_token()
-    user.verify_hash = _hash_token(raw_token)
-    user.verify_expires_at = utcnow() + timedelta(hours=VERIFY_TTL_HOURS)
-    user.updated_at = utcnow()
+    verify_token = secrets.token_urlsafe(32)
+    now = utcnow()
+    user.verify_token_hash = token_hash(verify_token)
+    user.verify_expires_at = now + timedelta(minutes=VERIFY_TOKEN_TTL_MIN)
+    user.updated_at = now
+    db.add(user)
     db.commit()
 
-    try:
-        link = _verify_link(email, raw_token)
-        _send_email(
-            email,
-            "Your AutoWeave verification link",
-            f"Verify your email:\n{link}\n\nThis link expires in {VERIFY_TTL_HOURS} hours.",
-        )
-    except Exception as e:
-        print(f"EMAIL_SEND_FAILED(resend_verify): {repr(e)}")
+    link = _make_verify_email_link(email, verify_token)
+    subject = "Verify your email"
+    body = f"""
+    <p>Hi,</p>
+    <p>Here is your new verification link:</p>
+    <p><a href="{link}">Verify email</a></p>
+    <p>This link expires in {VERIFY_TOKEN_TTL_MIN} minutes.</p>
+    """
 
-    return {"ok": True, "message": "If that email exists, a verification link has been sent."}
+    try:
+        _send_email(email, subject, body)
+    except Exception as e:
+        logger.exception("EMAIL_SEND_FAILED(resend_verify): %s", e)
+
+    return {"ok": True}
 
 
 @router.post("/auth/verify")
-def verify_email(data: VerifyIn, db: Session = Depends(get_db)):
-    email = data.email.lower().strip()
-    token = data.token.strip()
+def verify_email(payload: VerifyIn, db: Session = Depends(get_db)):
+    email = payload.email.strip().lower()
+    token = payload.token.strip()
 
+    user = db.query(OwUser).filter(OwUser.email == email).first()
+    if not user:
+        raise HTTPException(status_code=400, detail="Invalid verification request")
+
+    vhash = user.verify_token_hash
+    vexp = user.verify_expires_at
     now = utcnow()
 
-    user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
-    if not user:
-        raise HTTPException(status_code=400, detail="Invalid verification request.")
+    vexp_utc = ensure_utc(vexp)
+    if (not vhash) or (not vexp_utc) or (vexp_utc <= now):
+        raise HTTPException(status_code=400, detail="Verification token expired or invalid")
 
-    vhash = user.verify_hash
-    vexp = to_utc(user.verify_expires_at)
+    if not verify_token_hash(token, vhash):
+        raise HTTPException(status_code=400, detail="Verification token invalid")
 
-    if (not vhash) or (not vexp) or (vexp <= now):
-        raise HTTPException(status_code=400, detail="Verification link expired. Please resend.")
-
-    if _hash_token(token) != vhash:
-        raise HTTPException(status_code=400, detail="Invalid verification token.")
-
-    user.is_verified = True
-    user.verify_hash = None
+    user.is_email_verified = True
+    user.verify_token_hash = None
     user.verify_expires_at = None
-    user.updated_at = utcnow()
+    user.updated_at = now
+    db.add(user)
     db.commit()
-
-    return {"ok": True, "message": "Email verified."}
+    return {"ok": True}
 
 
 @router.post("/auth/forgot")
-def forgot_password(data: ForgotIn, db: Session = Depends(get_db)):
-    email = data.email.lower().strip()
-    user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
+def forgot_password(payload: ForgotIn, db: Session = Depends(get_db)):
+    email = payload.email.strip().lower()
+    user = db.query(OwUser).filter(OwUser.email == email).first()
 
-    # Always return OK (avoid account enumeration)
+    # Always respond OK
     if not user:
-        return {"ok": True, "message": "If that email exists, a reset link has been sent."}
+        return {"ok": True}
 
-    raw_token = _new_token()
-    token_hash = _hash_token(raw_token)
-    expires_at = utcnow() + timedelta(hours=RESET_TTL_HOURS)
+    reset_token = secrets.token_urlsafe(32)
+    now = utcnow()
+    exp = now + timedelta(minutes=RESET_TOKEN_TTL_MIN)
 
-    reset = PasswordReset(
-        user_id=user.id,
-        token_hash=token_hash,
-        expires_at=expires_at,
-        used_at=None,
-        created_at=utcnow(),
-    )
-    db.add(reset)
-    db.commit()
+    # Option A: inline reset token on user
+    if _user_has_inline_reset_tokens():
+        user.reset_token_hash = token_hash(reset_token)
+        user.reset_expires_at = exp
+        user.updated_at = now
+        db.add(user)
+        db.commit()
+    else:
+        # Option B: separate table
+        reset = OwPasswordReset(
+            email=email,
+            token_hash=token_hash(reset_token),
+            expires_at=exp,
+            used=False,
+            created_at=now,
+        )
+        db.add(reset)
+        db.commit()
+
+    link = _make_reset_email_link(email, reset_token)
+    subject = "Reset your password"
+    body = f"""
+    <p>Hi,</p>
+    <p>Click below to reset your password:</p>
+    <p><a href="{link}">Reset password</a></p>
+    <p>This link expires in {RESET_TOKEN_TTL_MIN} minutes.</p>
+    """
 
     try:
-        link = _reset_link(email, raw_token)
-        _send_email(
-            email,
-            "Reset your AutoWeave password",
-            f"Reset your password:\n{link}\n\nThis link expires in {RESET_TTL_HOURS} hours.",
-        )
+        _send_email(email, subject, body)
     except Exception as e:
-        print(f"EMAIL_SEND_FAILED(forgot): {repr(e)}")
+        logger.exception("EMAIL_SEND_FAILED(forgot): %s", e)
 
-    return {"ok": True, "message": "If that email exists, a reset link has been sent."}
+    return {"ok": True}
 
 
 @router.post("/auth/reset")
-def reset_password(data: ResetIn, db: Session = Depends(get_db)):
-    email = data.email.lower().strip()
-    token = data.token.strip()
+def reset_password(payload: ResetPasswordIn, db: Session = Depends(get_db)):
+    email = (payload.email or "").strip().lower()
+    token = (payload.token or "").strip()
+    new_pw = payload.new_password
+
+    if not email or not token or not new_pw:
+        raise HTTPException(status_code=400, detail="Missing fields")
+
     now = utcnow()
 
-    user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
-    if not user:
-        raise HTTPException(status_code=400, detail="Invalid reset request.")
+    # Option A: inline reset token on user record
+    if _user_has_inline_reset_tokens():
+        user = db.query(OwUser).filter(OwUser.email == email).first()
+        if not user:
+            return {"ok": True}  # do not leak existence
 
-    token_hash = _hash_token(token)
+        rhash = user.reset_token_hash
+        rexp = user.reset_expires_at
+        rexp_utc = ensure_utc(rexp)
 
+        if (not rhash) or (not rexp_utc) or (rexp_utc <= now):
+            raise HTTPException(status_code=400, detail="Reset token expired or invalid")
+
+        if not verify_token_hash(token, rhash):
+            raise HTTPException(status_code=400, detail="Reset token invalid")
+
+        user.hashed_password = hash_password(new_pw)
+        user.reset_token_hash = None
+        user.reset_expires_at = None
+        user.updated_at = now
+        db.add(user)
+        db.commit()
+        return {"ok": True}
+
+    # Option B: separate PasswordReset table
     reset = (
-        db.execute(
-            select(PasswordReset)
-            .where(PasswordReset.user_id == user.id)
-            .where(PasswordReset.token_hash == token_hash)
-            .order_by(PasswordReset.created_at.desc())
-        )
-        .scalars()
+        db.query(OwPasswordReset)
+        .filter(OwPasswordReset.email == email, OwPasswordReset.used == False)  # noqa: E712
+        .order_by(OwPasswordReset.created_at.desc())
         .first()
     )
-
     if not reset:
-        raise HTTPException(status_code=400, detail="Invalid reset token.")
+        raise HTTPException(status_code=400, detail="Reset token expired or invalid")
 
-    exp = to_utc(reset.expires_at)
-    if reset.used_at or (not exp) or (exp <= now):
-        raise HTTPException(status_code=400, detail="Reset link expired. Please request a new one.")
+    reset_exp_utc = ensure_utc(reset.expires_at)
+    if (not reset_exp_utc) or (reset_exp_utc <= now):
+        raise HTTPException(status_code=400, detail="Reset token expired or invalid")
 
-    user.password_hash = hash_password(data.new_password)
-    user.updated_at = utcnow()
+    if not verify_token_hash(token, reset.token_hash):
+        raise HTTPException(status_code=400, detail="Reset token invalid")
 
-    reset.used_at = utcnow()
-    db.commit()
-
-    return {"ok": True, "message": "Password updated."}
-
-
-@router.get("/auth/me")
-def me(request: Request, db: Session = Depends(get_db)):
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing token.")
-    token = auth.split(" ", 1)[1].strip()
-
-    payload = decode_access_token(token)
-    user_id = payload.get("sub")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid token.")
-
-    user = db.execute(select(User).where(User.id == int(user_id))).scalar_one_or_none()
+    user = db.query(OwUser).filter(OwUser.email == email).first()
     if not user:
-        raise HTTPException(status_code=401, detail="Invalid token.")
+        return {"ok": True}
 
-    return {"id": user.id, "email": user.email, "is_verified": user.is_verified}
+    user.hashed_password = hash_password(new_pw)
+    user.updated_at = now
+    reset.used = True
+    reset.used_at = now
+    db.add_all([user, reset])
+    db.commit()
+    return {"ok": True}
