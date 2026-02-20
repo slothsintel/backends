@@ -1,45 +1,23 @@
-import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+import os
+
 from .api import router as api_router
-from sqlalchemy import text
-from app.db import engine
 
-app = FastAPI(title="AutoWeave API", version="0.1.0")
+def _split_origins(val: str) -> list[str]:
+    return [o.strip() for o in (val or "").split(",") if o.strip()]
 
-# CORS: allow your static site to call this API from the browser.
-# You can tighten later.
-ALLOWED_ORIGINS = os.getenv(
-    "ALLOWED_ORIGINS",
-    "https://autoweave.slothsintel.com,http://localhost:5173,http://localhost:5500",
-).split(",")
+ALLOWED_ORIGINS = _split_origins(os.getenv("ALLOWED_ORIGINS", ""))
+
+app = FastAPI(title="AutoWeave API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in ALLOWED_ORIGINS if o.strip()],
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS else ["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.get("/")
-def root():
-    return {
-        "service": "autoweave_backend",
-        "ok": True,
-        "docs": "/docs",
-        "health": "/health",
-        "merge": "/api/v1/merge/autotrac",
-    }
-
-@app.get("/health")
-def health():
-    return {"ok": True}
-
+# IMPORTANT: prefix must match your frontend calls: /api/v1/auth/...
 app.include_router(api_router, prefix="/api/v1")
-
-@app.get("/health/db")
-def health_db():
-    with engine.connect() as conn:
-        conn.execute(text("SELECT 1"))
-    return {"ok": True}

@@ -1,67 +1,35 @@
-from __future__ import annotations
-
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional, Union
+from jose import jwt, JWTError
 
-from jose import JWTError, jwt
-from passlib.context import CryptContext
+JWT_SECRET = os.getenv("JWT_SECRET", "")
+JWT_ALG = os.getenv("JWT_ALG", "HS256")
+JWT_EXPIRES_MINUTES = int(os.getenv("JWT_EXPIRES_MINUTES", "10080"))  # 7 days default
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
+if not JWT_SECRET:
+    raise RuntimeError("JWT_SECRET is not set")
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
+def create_access_token(sub: str) -> str:
+    now = utcnow()
+    payload = {
+        "sub": sub,
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(minutes=JWT_EXPIRES_MINUTES)).timestamp()),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
 
-# -------------------------
-# Password hashing
-# -------------------------
-def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+def decode_access_token(token: str) -> dict:
+    return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
 
-
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
-
-
-# -------------------------
-# JWT
-# -------------------------
-ALGORITHM = "HS256"
-
-
-def create_access_token(
-    subject_or_payload: Union[int, str, Dict[str, Any]],
-    secret: Optional[str] = None,
-    expires_minutes: int = 60 * 24,
-) -> str:
-    """
-    Backward compatible:
-
-    - create_access_token(user_id)
-    - create_access_token({"sub": "123"}, secret, minutes)
-    """
-
-    if secret is None:
-        secret = os.getenv("JWT_SECRET", "dev-secret-change-me")
-
-    if isinstance(subject_or_payload, (int, str)):
-        payload: Dict[str, Any] = {"sub": str(subject_or_payload)}
-    else:
-        payload = dict(subject_or_payload)
-
-    expire = utcnow() + timedelta(minutes=expires_minutes)
-    payload["exp"] = expire
-
-    return jwt.encode(payload, secret, algorithm=ALGORITHM)
-
-
-def decode_token(token: str, secret: Optional[str] = None) -> Dict[str, Any]:
-    if secret is None:
-        secret = os.getenv("JWT_SECRET", "dev-secret-change-me")
-
+def safe_decode_sub(token: str) -> str | None:
     try:
-        return jwt.decode(token, secret, algorithms=[ALGORITHM])
+        payload = decode_access_token(token)
+        return payload.get("sub")
     except JWTError:
-        raise
+        return None
+
+# Backward-compat alias (prevents ImportError: decode_token)
+decode_token = decode_access_token
