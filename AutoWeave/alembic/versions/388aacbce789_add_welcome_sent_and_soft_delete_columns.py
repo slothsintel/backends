@@ -1,7 +1,7 @@
 """add welcome_sent and soft delete columns
 
 Revision ID: 388aacbce789
-Revises: <PUT_YOUR_PREVIOUS_REVISION_ID_HERE>
+Revises: 0002_ow_users_tokens
 """
 
 from alembic import op
