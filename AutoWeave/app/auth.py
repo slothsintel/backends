@@ -4,7 +4,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Union
 
-import jwt
+from jose import JWTError, jwt
 from passlib.context import CryptContext
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -14,12 +14,21 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# -------------------------
+# Password hashing
+# -------------------------
 def hash_password(password: str) -> str:
     return pwd_context.hash(password)
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
+
+
+# -------------------------
+# JWT
+# -------------------------
+ALGORITHM = "HS256"
 
 
 def create_access_token(
@@ -30,9 +39,10 @@ def create_access_token(
     """
     Backward compatible:
 
-    - Old usage: create_access_token(user_id)
-    - New usage: create_access_token({"sub": "123"}, secret, minutes)
+    - create_access_token(user_id)
+    - create_access_token({"sub": "123"}, secret, minutes)
     """
+
     if secret is None:
         secret = os.getenv("JWT_SECRET", "dev-secret-change-me")
 
@@ -43,10 +53,15 @@ def create_access_token(
 
     expire = utcnow() + timedelta(minutes=expires_minutes)
     payload["exp"] = expire
-    return jwt.encode(payload, secret, algorithm="HS256")
+
+    return jwt.encode(payload, secret, algorithm=ALGORITHM)
 
 
 def decode_token(token: str, secret: Optional[str] = None) -> Dict[str, Any]:
     if secret is None:
         secret = os.getenv("JWT_SECRET", "dev-secret-change-me")
-    return jwt.decode(token, secret, algorithms=["HS256"])
+
+    try:
+        return jwt.decode(token, secret, algorithms=[ALGORITHM])
+    except JWTError:
+        raise
