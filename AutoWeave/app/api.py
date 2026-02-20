@@ -15,10 +15,17 @@ from .models import OwUser, OwPasswordReset
 from .mailer import send_email
 from .auth import create_access_token, safe_decode_sub
 
+from fastapi import Depends, HTTPException
+from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError
+
+from .auth import safe_decode_sub  # your helper that returns sub or None
+from .passwords import verify_password
+
 # main.py mounts this router at prefix="/api/v1"
 # final URLs: /api/v1/auth/...
 router = APIRouter(prefix="/auth", tags=["auth"])
-
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 
 # ------------------------
 # Helpers
@@ -415,51 +422,31 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db))
     return {"ok": True}
 
 
-@router.post("/delete-account")
+@router.post("/auth/delete-account")
 def delete_account(
     payload: DeleteAccountRequest,
+    token: str = Depends(oauth2_scheme),
     db: Session = Depends(get_db),
-    authorization: str | None = Header(None),
 ):
-    """
-    Let a logged-in user delete their own account.
+    sub = safe_decode_sub(token)
+    if not sub:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
-    Safety measures:
-    - Requires Bearer token (logged in)
-    - Requires password re-check (prevents stolen-token deletion)
-    - Requires typing confirm="DELETE"
+    # ✅ IMPORTANT: sub is user.id (string), so query by id
+    user = db.query(OwUser).filter(OwUser.id == int(sub)).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
-    Default behavior:
-    - Soft-delete if your OwUser model has (is_deleted, deleted_at)
-    - Otherwise, hard-delete the user row (and reset audit rows)
-    """
-    user = _require_current_user(db, authorization)
-
-    if payload.confirm.strip().upper() != "DELETE":
+    if payload.confirm.upper() != "DELETE":
         raise HTTPException(status_code=400, detail='Type "DELETE" to confirm')
 
     if not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid password")
 
-    now = utcnow()
-
-    # Clear any active tokens (good hygiene)
-    user.verify_hash = None
-    user.verify_expires_at = None
-    user.reset_hash = None
-    user.reset_expires_at = None
-
-    # Prefer soft-delete if columns exist; otherwise hard-delete
-    if hasattr(user, "is_deleted") and hasattr(user, "deleted_at"):
-        user.is_deleted = True
-        user.deleted_at = now
-        user.updated_at = now
-        db.add(user)
-        db.commit()
-        return {"ok": True}
-
-    # Hard delete fallback
-    db.query(OwPasswordReset).filter(OwPasswordReset.user_id == user.id).delete()
-    db.delete(user)
+    # soft delete
+    user.is_deleted = True
+    user.deleted_at = utcnow()
+    db.add(user)
     db.commit()
+
     return {"ok": True}
