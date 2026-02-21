@@ -8,7 +8,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
-
 from passlib.context import CryptContext
 
 from .db import get_db
@@ -16,8 +15,9 @@ from .models import OwUser, OwPasswordReset
 from .mailer import send_email
 from .auth import create_access_token, safe_decode_sub
 
-# main.py mounts this router at prefix="/api/v1"
-# so this router must be prefix="/auth" -> final URLs: /api/v1/auth/...
+# IMPORTANT:
+# main.py already does: app.include_router(api_router, prefix="/api/v1")
+# So router prefix here must be "/auth" (final path: /api/v1/auth/...)
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
@@ -39,7 +39,6 @@ def new_token_urlsafe(nbytes: int = 24) -> str:
 
 
 def frontend_url() -> str:
-    # prefer explicit FRONTEND_URL; fallback to PUBLIC_APP_URL
     return (os.getenv("FRONTEND_URL") or os.getenv("PUBLIC_APP_URL") or "").rstrip("/")
 
 
@@ -75,11 +74,7 @@ class VerifyRequest(BaseModel):
     token: str
 
 
-class ForgotRequest(BaseModel):
-    email: EmailStr
-
-
-class ResendVerifyRequest(BaseModel):
+class EmailOnly(BaseModel):
     email: EmailStr
 
 
@@ -157,14 +152,13 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/resend-verify")
-def resend_verify(payload: ResendVerifyRequest, db: Session = Depends(get_db)):
+def resend_verify(payload: EmailOnly, db: Session = Depends(get_db)):
     email = payload.email.lower().strip()
     user = db.query(OwUser).filter(OwUser.email == email).first()
 
     # Always 200 (don’t leak existence)
     if not user:
         return {"ok": True}
-
     if user.is_verified:
         return {"ok": True}
 
@@ -194,18 +188,17 @@ def resend_verify(payload: ResendVerifyRequest, db: Session = Depends(get_db)):
 @router.post("/verify")
 def verify_email(payload: VerifyRequest, db: Session = Depends(get_db)):
     email = payload.email.lower().strip()
-    token = payload.token.strip()
-    token_hash = sha256_hex(token)
+    token_hash = sha256_hex(payload.token.strip())
     now = utcnow()
 
     user = db.query(OwUser).filter(OwUser.email == email).first()
     if not user:
         raise HTTPException(status_code=400, detail="Invalid or expired token")
 
-    vhash = user.verify_hash
-    vexp = user.verify_expires_at
+    if (not user.verify_hash) or (not user.verify_expires_at):
+        raise HTTPException(status_code=400, detail="Invalid or expired token")
 
-    if (not vhash) or (not vexp) or (vexp <= now) or (vhash != token_hash):
+    if user.verify_expires_at <= now or user.verify_hash != token_hash:
         raise HTTPException(status_code=400, detail="Invalid or expired token")
 
     user.is_verified = True
@@ -228,7 +221,6 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
-    # soft delete support (if your model has these fields)
     if getattr(user, "is_deleted", False):
         raise HTTPException(status_code=401, detail="Account is deleted")
 
@@ -238,7 +230,7 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     if not user.is_verified:
         raise HTTPException(status_code=401, detail="Email not verified")
 
-    token = create_access_token(str(user.id))  # IMPORTANT: sub=user.id
+    token = create_access_token(str(user.id))  # sub = user.id
     user.updated_at = utcnow()
     db.add(user)
     db.commit()
@@ -247,14 +239,13 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/forgot")
-def forgot_password(payload: ForgotRequest, db: Session = Depends(get_db)):
+def forgot_password(payload: EmailOnly, db: Session = Depends(get_db)):
     email = payload.email.lower().strip()
     user = db.query(OwUser).filter(OwUser.email == email).first()
 
     # Always 200
     if not user:
         return {"ok": True}
-
     if getattr(user, "is_deleted", False):
         return {"ok": True}
 
@@ -266,7 +257,6 @@ def forgot_password(payload: ForgotRequest, db: Session = Depends(get_db)):
     user.updated_at = utcnow()
     db.add(user)
 
-    # Optional audit row
     db.add(
         OwPasswordReset(
             user_id=user.id,
@@ -297,7 +287,7 @@ def forgot_password(payload: ForgotRequest, db: Session = Depends(get_db)):
 @router.post("/reset")
 def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db)):
     email = payload.email.lower().strip()
-    token = payload.token.strip()
+    token_hash = sha256_hex(payload.token.strip())
     new_pw = payload.new_password
 
     if len(new_pw) < 8:
@@ -311,9 +301,10 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db))
         raise HTTPException(status_code=400, detail="Invalid or expired token")
 
     now = utcnow()
-    token_hash = sha256_hex(token)
+    if (not user.reset_hash) or (not user.reset_expires_at):
+        raise HTTPException(status_code=400, detail="Invalid or expired token")
 
-    if (not user.reset_hash) or (not user.reset_expires_at) or (user.reset_expires_at <= now) or (user.reset_hash != token_hash):
+    if user.reset_expires_at <= now or user.reset_hash != token_hash:
         raise HTTPException(status_code=400, detail="Invalid or expired token")
 
     user.password_hash = hash_password(new_pw)
@@ -333,14 +324,12 @@ def delete_account(
     db: Session = Depends(get_db),
 ):
     """
-    Soft-delete current user.
-    IMPORTANT: token sub is user.id (string), not email.
+    FIX: JWT sub is user.id, so query by id (Integer in your models.py).
     """
     sub = safe_decode_sub(token)
     if not sub:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    # sub is user.id
     try:
         user_id = int(sub)
     except Exception:
@@ -356,11 +345,11 @@ def delete_account(
     if not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid password")
 
-    # Soft delete if fields exist; otherwise hard delete
+    # Soft-delete if columns exist in DB/model, else hard delete.
     if hasattr(user, "is_deleted"):
-        setattr(user, "is_deleted", True)
+        user.is_deleted = True
         if hasattr(user, "deleted_at"):
-            setattr(user, "deleted_at", utcnow())
+            user.deleted_at = utcnow()
         user.updated_at = utcnow()
         db.add(user)
         db.commit()
