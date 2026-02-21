@@ -15,9 +15,9 @@ from .models import OwUser, OwPasswordReset
 from .mailer import send_email
 from .auth import create_access_token, safe_decode_sub
 
-# IMPORTANT:
-# main.py already does: app.include_router(api_router, prefix="/api/v1")
-# So router prefix here must be "/auth" (final path: /api/v1/auth/...)
+# NOTE:
+# main.py includes this router with prefix="/api/v1"
+# so keep router prefix="/auth" -> final: /api/v1/auth/...
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
@@ -39,6 +39,8 @@ def new_token_urlsafe(nbytes: int = 24) -> str:
 
 
 def frontend_url() -> str:
+    # Use one of these in Render env vars:
+    # FRONTEND_URL=https://autoweave.slothsintel.com
     return (os.getenv("FRONTEND_URL") or os.getenv("PUBLIC_APP_URL") or "").rstrip("/")
 
 
@@ -54,6 +56,42 @@ def build_reset_link(email: str, token: str) -> str:
     if not base:
         return ""
     return f"{base}/tech.html?mode=reset&email={email}&token={token}#workbench"
+
+
+def send_verify_email(to_email: str, link: str, is_resend: bool = False) -> None:
+    subject = "AutoWeave – Verify your email" + (" (resend)" if is_resend else "")
+    text = (
+        "Welcome to AutoWeave 👋\n\n"
+        "Please verify your email by clicking the link below:\n\n"
+        f"{link}\n\n"
+        "This link will expire in 24 hours.\n\n"
+        "If you did not create this account, you can ignore this email.\n\n"
+        "— Sloths Intel Team"
+    )
+    send_email(to_email=to_email, subject=subject, text_body=text)
+
+
+def send_reset_email(to_email: str, link: str) -> None:
+    subject = "AutoWeave – Reset your password"
+    text = (
+        "Reset your password using the link below:\n\n"
+        f"{link}\n\n"
+        "This link will expire in 2 hours.\n\n"
+        "If you did not request this reset, ignore this email.\n\n"
+        "— Sloths Intel Team"
+    )
+    send_email(to_email=to_email, subject=subject, text_body=text)
+
+
+def send_welcome_email(to_email: str) -> None:
+    subject = "Welcome to AutoWeave 👋"
+    text = (
+        "Welcome to AutoWeave!\n\n"
+        "You can now sign in and start weaving your CSVs into clean, reliable outputs.\n\n"
+        "If you ever need help, just reply to this email.\n\n"
+        "— Sloths Intel Team"
+    )
+    send_email(to_email=to_email, subject=subject, text_body=text)
 
 
 # ------------------------
@@ -135,18 +173,7 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
 
     link = build_verify_link(user.email, token)
     if link:
-        send_email(
-            to_email=user.email,
-            subject="AutoWeave – Verify your email",
-            text_body=(
-                "Welcome to AutoWeave 👋\n\n"
-                "Please verify your email by clicking the link below:\n\n"
-                f"{link}\n\n"
-                "This link will expire in 24 hours.\n\n"
-                "If you did not create this account, you can ignore this email.\n\n"
-                "— Sloths Intel"
-            ),
-        )
+        send_verify_email(user.email, link, is_resend=False)
 
     return {"ok": True}
 
@@ -158,6 +185,8 @@ def resend_verify(payload: EmailOnly, db: Session = Depends(get_db)):
 
     # Always 200 (don’t leak existence)
     if not user:
+        return {"ok": True}
+    if getattr(user, "is_deleted", False):
         return {"ok": True}
     if user.is_verified:
         return {"ok": True}
@@ -171,16 +200,7 @@ def resend_verify(payload: EmailOnly, db: Session = Depends(get_db)):
 
     link = build_verify_link(user.email, token)
     if link:
-        send_email(
-            to_email=user.email,
-            subject="AutoWeave – Verify your email (resend)",
-            text_body=(
-                "Here is your new verification link:\n\n"
-                f"{link}\n\n"
-                "This link will expire in 24 hours.\n\n"
-                "— Sloths Intel"
-            ),
-        )
+        send_verify_email(user.email, link, is_resend=True)
 
     return {"ok": True}
 
@@ -189,22 +209,49 @@ def resend_verify(payload: EmailOnly, db: Session = Depends(get_db)):
 def verify_email(payload: VerifyRequest, db: Session = Depends(get_db)):
     email = payload.email.lower().strip()
     token_hash = sha256_hex(payload.token.strip())
-    now = utcnow()
 
     user = db.query(OwUser).filter(OwUser.email == email).first()
     if not user:
-        raise HTTPException(status_code=400, detail="Invalid or expired token")
+        raise HTTPException(status_code=400, detail="Invalid verification link")
 
-    if (not user.verify_hash) or (not user.verify_expires_at):
-        raise HTTPException(status_code=400, detail="Invalid or expired token")
+    if getattr(user, "is_deleted", False):
+        raise HTTPException(status_code=400, detail="Invalid verification link")
 
-    if user.verify_expires_at <= now or user.verify_hash != token_hash:
-        raise HTTPException(status_code=400, detail="Invalid or expired token")
+    if user.is_verified:
+        # Idempotent success
+        return {"ok": True}
+
+    if not user.verify_hash or user.verify_hash != token_hash:
+        raise HTTPException(status_code=400, detail="Invalid verification link")
+
+    if not user.verify_expires_at or user.verify_expires_at < utcnow():
+        raise HTTPException(status_code=400, detail="Verification link expired")
 
     user.is_verified = True
     user.verify_hash = None
     user.verify_expires_at = None
-    user.updated_at = now
+    user.updated_at = utcnow()
+
+    # Optional: welcome email + "welcome_sent" bookkeeping (only if you add these columns in your model later)
+    should_send_welcome = True
+    if hasattr(OwUser, "welcome_sent"):
+        # if model/column exists, only send once
+        try:
+            if getattr(user, "welcome_sent", False):
+                should_send_welcome = False
+        except Exception:
+            pass
+
+    if should_send_welcome:
+        try:
+            send_welcome_email(user.email)
+            if hasattr(OwUser, "welcome_sent"):
+                setattr(user, "welcome_sent", True)
+            if hasattr(OwUser, "welcome_sent_at"):
+                setattr(user, "welcome_sent_at", utcnow())
+        except Exception:
+            # do not fail verify because email sending failed
+            pass
 
     db.add(user)
     db.commit()
@@ -230,7 +277,7 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     if not user.is_verified:
         raise HTTPException(status_code=401, detail="Email not verified")
 
-    token = create_access_token(str(user.id))  # sub = user.id
+    token = create_access_token(str(user.id))  # sub = user.id (stringified)
     user.updated_at = utcnow()
     db.add(user)
     db.commit()
@@ -269,17 +316,7 @@ def forgot_password(payload: EmailOnly, db: Session = Depends(get_db)):
 
     link = build_reset_link(user.email, token)
     if link:
-        send_email(
-            to_email=user.email,
-            subject="AutoWeave – Reset your password",
-            text_body=(
-                "Reset your password using the link below:\n\n"
-                f"{link}\n\n"
-                "This link will expire in 2 hours.\n\n"
-                "If you did not request this reset, ignore this email.\n\n"
-                "— Sloths Intel"
-            ),
-        )
+        send_reset_email(user.email, link)
 
     return {"ok": True}
 
@@ -295,26 +332,36 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db))
 
     user = db.query(OwUser).filter(OwUser.email == email).first()
     if not user:
-        raise HTTPException(status_code=400, detail="Invalid or expired token")
+        raise HTTPException(status_code=400, detail="Invalid reset link")
 
     if getattr(user, "is_deleted", False):
-        raise HTTPException(status_code=400, detail="Invalid or expired token")
+        raise HTTPException(status_code=400, detail="Invalid reset link")
 
-    now = utcnow()
-    if (not user.reset_hash) or (not user.reset_expires_at):
-        raise HTTPException(status_code=400, detail="Invalid or expired token")
+    if not user.reset_hash or user.reset_hash != token_hash:
+        raise HTTPException(status_code=400, detail="Invalid reset link")
 
-    if user.reset_expires_at <= now or user.reset_hash != token_hash:
-        raise HTTPException(status_code=400, detail="Invalid or expired token")
+    if not user.reset_expires_at or user.reset_expires_at < utcnow():
+        raise HTTPException(status_code=400, detail="Reset link expired")
+
+    # Mark password reset token row (best effort)
+    pr = (
+        db.query(OwPasswordReset)
+        .filter(OwPasswordReset.user_id == user.id, OwPasswordReset.token_hash == token_hash)
+        .first()
+    )
+    if pr and pr.used_at is None:
+        pr.used_at = utcnow()
+        db.add(pr)
 
     user.password_hash = hash_password(new_pw)
     user.reset_hash = None
     user.reset_expires_at = None
-    user.updated_at = now
+    user.updated_at = utcnow()
     db.add(user)
     db.commit()
 
     return {"ok": True}
+
 
 @router.post("/delete-account")
 def delete_account(
@@ -324,7 +371,7 @@ def delete_account(
 ):
     """
     Accept BOTH styles of JWT:
-    - newer: sub = user.id (int)
+    - newer: sub = user.id (int-ish)
     - older: sub = email (string)
     """
     sub = safe_decode_sub(token)
@@ -354,15 +401,16 @@ def delete_account(
     if not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid password")
 
-    # Soft-delete if columns exist in DB/model, else hard delete.
-    if hasattr(user, "is_deleted"):
-        user.is_deleted = True
-        if hasattr(user, "deleted_at"):
-            user.deleted_at = utcnow()
+    # Soft-delete if your MODEL has these columns (add them later if you want).
+    if hasattr(OwUser, "is_deleted"):
+        setattr(user, "is_deleted", True)
+        if hasattr(OwUser, "deleted_at"):
+            setattr(user, "deleted_at", utcnow())
         user.updated_at = utcnow()
         db.add(user)
         db.commit()
     else:
+        # Hard delete (current models.py does not have soft-delete fields)
         db.delete(user)
         db.commit()
 
