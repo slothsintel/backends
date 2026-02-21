@@ -316,7 +316,6 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db))
 
     return {"ok": True}
 
-
 @router.post("/delete-account")
 def delete_account(
     payload: DeleteAccountRequest,
@@ -324,18 +323,28 @@ def delete_account(
     db: Session = Depends(get_db),
 ):
     """
-    FIX: JWT sub is user.id, so query by id (Integer in your models.py).
+    Accept BOTH styles of JWT:
+    - newer: sub = user.id (int)
+    - older: sub = email (string)
     """
     sub = safe_decode_sub(token)
     if not sub:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    try:
-        user_id = int(sub)
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid token")
+    user = None
 
-    user = db.query(OwUser).filter(OwUser.id == user_id).first()
+    # Try new-style token: sub=user.id
+    try:
+        user_id = int(str(sub))
+        user = db.query(OwUser).filter(OwUser.id == user_id).first()
+    except Exception:
+        user = None
+
+    # Fallback old-style token: sub=email
+    if user is None:
+        email = str(sub).lower().strip()
+        user = db.query(OwUser).filter(OwUser.email == email).first()
+
     if not user:
         raise HTTPException(status_code=401, detail="Invalid token")
 
