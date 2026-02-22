@@ -4,7 +4,7 @@ import secrets
 import hashlib
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
@@ -20,7 +20,7 @@ from .auth import create_access_token, safe_decode_sub
 # so keep router prefix="/auth" -> final: /api/v1/auth/...
 router = APIRouter(prefix="/auth", tags=["auth"])
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login", auto_error=False)
 
 
 # ------------------------
@@ -366,7 +366,8 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db))
 @router.post("/delete-account")
 def delete_account(
     payload: DeleteAccountRequest,
-    token: str = Depends(oauth2_scheme),
+    request: Request,
+    token: str | None = Depends(oauth2_scheme),
     db: Session = Depends(get_db),
 ):
     """
@@ -374,6 +375,17 @@ def delete_account(
     - newer: sub = user.id (int-ish)
     - older: sub = email (string)
     """
+    auth = request.headers.get("authorization", "")
+    if not token:
+        if auth.lower().startswith("bearer "):
+            token = auth.split(" ", 1)[1].strip()
+
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing token")
+
+    print("DELETE-ACCOUNT auth header present =", bool(auth))
+    print("DELETE-ACCOUNT token length =", len(token or ""))
+
     sub = safe_decode_sub(token)
     if not sub:
         raise HTTPException(status_code=401, detail="Invalid token")
