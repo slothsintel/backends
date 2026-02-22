@@ -1,6 +1,16 @@
 import os
 from datetime import datetime, timedelta, timezone
 from jose import jwt, JWTError
+from passlib.context import CryptContext
+
+pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
+
+def hash_password(pw: str) -> str:
+    return pwd_context.hash(pw)
+
+def verify_password(pw: str, pw_hash: str) -> bool:
+    return pwd_context.verify(pw, pw_hash)
+
 
 JWT_SECRET = os.getenv("JWT_SECRET", "")
 JWT_ALG = os.getenv("JWT_ALG", "HS256")
