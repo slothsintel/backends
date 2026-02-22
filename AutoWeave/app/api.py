@@ -29,7 +29,7 @@ if not JWT_SECRET:
     # Hard fail so you don't silently mint unverifiable tokens.
     raise RuntimeError("JWT_SECRET is not set")
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login", auto_error=False)
 
 
 def utcnow() -> datetime:
@@ -266,41 +266,55 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db))
 # =========================
 # Delete account (FIXED)
 # =========================
-@router.post("/auth/delete-account")
+@router.post("/delete-account")
 def delete_account(
     payload: DeleteAccountRequest,
-    request: Request,
-    token: str = Depends(oauth2_scheme),
+    token: str | None = Depends(oauth2_scheme),
     db: Session = Depends(get_db),
 ):
-    """
-    Accept BOTH:
-      - sub = user.id (new tokens)
-      - sub = email (legacy tokens)
-    """
+    # 1) confirm phrase
+    if payload.confirm.strip().upper() != "DELETE":
+        raise HTTPException(status_code=400, detail='Type "DELETE" to confirm')
 
-    sub = safe_decode_sub(token)
-    if not sub:
-        raise HTTPException(status_code=401, detail="Invalid token")
+    user = None
 
-    # Determine if sub is an integer id or an email
-    user: Optional[OwUser] = None
-    if sub.isdigit():
-        user = db.query(OwUser).filter(OwUser.id == int(sub)).first()
-    else:
-        user = db.query(OwUser).filter(OwUser.email == sub.lower().strip()).first()
+    # 2) Try token first (best UX)
+    if token:
+        # extra safety: strip accidental "Bearer " prefix if it somehow got stored
+        t = token.strip()
+        if t.lower().startswith("bearer "):
+            t = t.split(" ", 1)[1].strip()
+
+        sub = safe_decode_sub(t)
+        if sub:
+            # sub could be id or email
+            try:
+                user_id = int(sub)
+                user = db.query(OwUser).filter(OwUser.id == user_id).first()
+            except Exception:
+                user = db.query(OwUser).filter(OwUser.email == sub.lower().strip()).first()
+
+    # 3) Fallback: email from payload (THIS is the “sure fix”)
+    if not user:
+        user = db.query(OwUser).filter(OwUser.email == payload.email.lower().strip()).first()
 
     if not user:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    if payload.confirm.strip().upper() != "DELETE":
-        raise HTTPException(status_code=400, detail='Type "DELETE" to confirm')
-
+    # 4) Verify password
     if not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid password")
 
-    # Hard delete (simple + reliable)
-    db.delete(user)
-    db.commit()
+    # 5) Soft delete if columns exist
+    if hasattr(user, "is_deleted"):
+        user.is_deleted = True
+        if hasattr(user, "deleted_at"):
+            user.deleted_at = utcnow()
+        user.updated_at = utcnow()
+        db.add(user)
+        db.commit()
+    else:
+        db.delete(user)
+        db.commit()
 
     return {"ok": True}
