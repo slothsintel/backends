@@ -170,7 +170,11 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
 @router.post("/auth/login")
 def login(payload: LoginRequest, db: Session = Depends(get_db)):
     email = payload.email.lower().strip()
-    user = db.query(OwUser).filter(OwUser.email == email).first()
+    user = (
+    db.query(OwUser)
+    .filter(OwUser.email == email, OwUser.is_deleted == False)  # noqa: E712
+    .first()
+    )
 
     if not user:
         raise HTTPException(status_code=401, detail="Invalid email or password")
