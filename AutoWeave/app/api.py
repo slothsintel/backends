@@ -16,8 +16,13 @@ from .models import OwUser
 from .auth import hash_password, verify_password
 from .mailer import send_email
 from .auth import create_access_token, safe_decode_sub, hash_password, verify_password
+from .login import router as login_router
+from .register import router as register_router
+from .delete_account import router as delete_account_router
 
-router = APIRouter()
+router.include_router(login_router)
+router.include_router(register_router)
+router.include_router(delete_account_router)
 
 # =========================
 # JWT / Security
@@ -264,58 +269,3 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db))
     return {"ok": True}
 
 
-# =========================
-# Delete account (FIXED)
-# =========================
-@router.post("/delete-account")
-def delete_account(
-    payload: DeleteAccountRequest,
-    token: str | None = Depends(oauth2_scheme),
-    db: Session = Depends(get_db),
-):
-    # 1) confirm phrase
-    if payload.confirm.strip().upper() != "DELETE":
-        raise HTTPException(status_code=400, detail='Type "DELETE" to confirm')
-
-    user = None
-
-    # 2) Try token first (best UX)
-    if token:
-        # extra safety: strip accidental "Bearer " prefix if it somehow got stored
-        t = token.strip()
-        if t.lower().startswith("bearer "):
-            t = t.split(" ", 1)[1].strip()
-
-        sub = safe_decode_sub(t)
-        if sub:
-            # sub could be id or email
-            try:
-                user_id = int(sub)
-                user = db.query(OwUser).filter(OwUser.id == user_id).first()
-            except Exception:
-                user = db.query(OwUser).filter(OwUser.email == sub.lower().strip()).first()
-
-    # 3) Fallback: email from payload (THIS is the “sure fix”)
-    if not user:
-        user = db.query(OwUser).filter(OwUser.email == payload.email.lower().strip()).first()
-
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    # 4) Verify password
-    if not verify_password(payload.password, user.password_hash):
-        raise HTTPException(status_code=401, detail="Invalid password")
-
-    # 5) Soft delete if columns exist
-    if hasattr(user, "is_deleted"):
-        user.is_deleted = True
-        if hasattr(user, "deleted_at"):
-            user.deleted_at = utcnow()
-        user.updated_at = utcnow()
-        db.add(user)
-        db.commit()
-    else:
-        db.delete(user)
-        db.commit()
-
-    return {"ok": True}
