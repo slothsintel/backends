@@ -5,7 +5,8 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, File, UploadFile
+from .services.merge import trim_aggregate_and_join
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr, Field
@@ -300,4 +301,16 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db))
     db.commit()
     return {"ok": True}
 
-
+@router.post("/merge/autotrac")
+async def merge_autotrac(
+    time_entries_csv: UploadFile = File(...),
+    incomes_csv: UploadFile = File(...),
+    projects_csv: UploadFile | None = File(None),
+):
+    """
+    Matches frontend FormData field names:
+      - time_entries_csv (required)
+      - incomes_csv (required)
+      - projects_csv (optional)
+    """
+    return await trim_aggregate_and_join(time_entries_csv, incomes_csv, projects_csv)
