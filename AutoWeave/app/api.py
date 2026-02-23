@@ -136,9 +136,41 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
     email = payload.email.lower().strip()
 
     existing = db.query(OwUser).filter(OwUser.email == email).first()
-    if existing:
+
+    # If an active account exists, block as before
+    if existing and not getattr(existing, "is_deleted", False):
         raise HTTPException(status_code=400, detail="Email already registered")
 
+    # If a soft-deleted account exists, REACTIVATE it instead of creating a new row
+    if existing and getattr(existing, "is_deleted", False):
+        existing.is_deleted = False
+        existing.deleted_at = None
+        existing.password_hash = hash_password(payload.password)
+
+        # force email verification again (safer)
+        existing.is_verified = False
+        existing.verify_hash = None
+        existing.verify_expires_at = None
+        existing.reset_hash = None
+        existing.reset_expires_at = None
+
+        existing.updated_at = utcnow()
+
+        db.add(existing)
+        db.commit()
+        db.refresh(existing)
+
+        verify_token = create_access_token(sub=existing.email)
+        verify_link = build_frontend_url(f"/verify.html?token={verify_token}")
+
+        send_email(
+            to_email=existing.email,
+            subject="Verify your AutoWeave account",
+            text_body=email_verify_text(existing.email, verify_link),
+        )
+        return {"ok": True}
+
+    # Otherwise: brand new user
     user = OwUser(
         email=email,
         password_hash=hash_password(payload.password),
@@ -154,8 +186,7 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(user)
 
-    # create verify token (simple signed JWT is enough)
-    verify_token = create_access_token(sub=user.email)  # verify by email is OK
+    verify_token = create_access_token(sub=user.email)
     verify_link = build_frontend_url(f"/verify.html?token={verify_token}")
 
     send_email(
