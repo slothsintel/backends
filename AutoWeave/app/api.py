@@ -17,6 +17,8 @@ from .auth import hash_password, verify_password
 from .mailer import send_email
 from .auth import create_access_token, safe_decode_sub, hash_password, verify_password
 from .delete_account import router as delete_account_router
+
+router = APIRouter()
 router.include_router(delete_account_router)
 
 # =========================
