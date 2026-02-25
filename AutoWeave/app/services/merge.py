@@ -56,7 +56,18 @@ def _drop_if_empty(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
 
 
 def _to_date(series: pd.Series) -> pd.Series:
-    dt = pd.to_datetime(series, errors="coerce", utc=True)
+    s = series.astype("string").str.strip()
+    # common “CSV mess” cleanup
+    s = s.str.replace(r",+$", "", regex=True)
+
+    dt = pd.to_datetime(s, errors="coerce", utc=True)
+
+    # fallback: try again without utc if some values failed
+    if dt.isna().any():
+        dt2 = pd.to_datetime(s, errors="coerce")
+        # fill only the missing ones
+        dt = dt.fillna(dt2)
+
     return dt.dt.date
 
 
