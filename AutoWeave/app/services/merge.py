@@ -202,7 +202,6 @@ async def trim_aggregate_and_join(
     # ---- Add frontend-friendly aliases (minimal change) ----
     merged_out = merged.copy()
     merged_out["project"] = merged_out["project_name"]
-    merged_out["work_date"] = merged_out["date"]
 
     # Use GBP if available, else amount
     if "amount_gbp" in merged_out.columns:
@@ -211,7 +210,7 @@ async def trim_aggregate_and_join(
         merged_out["income"] = merged_out["amount"]
 
     # Put expected columns first (keep existing cols after)
-    front_cols = ["work_date", "project", "income", "duration_hours"]
+    front_cols = ["date", "project", "income", "duration_hours"]
     rest_cols = [c for c in merged_out.columns if c not in front_cols]
     merged_out = merged_out[front_cols + rest_cols]
 
