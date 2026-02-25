@@ -194,6 +194,21 @@ async def trim_aggregate_and_join(
     merged_out = merged.drop_duplicates()
 
     merged_out = _ensure_final_cols(merged_out)
+
+    # Rename project_name -> project (output only; joins already done above)
+    merged_out = merged_out.rename(columns={"project_name": "project"})
+
+    # Duplicate amount to income (prefer GBP if available, else raw amount)
+    if "amount_gbp" in merged_out.columns:
+        merged_out["income"] = merged_out["amount_gbp"].where(~merged_out["amount_gbp"].isna(), merged_out["amount"])
+    else:
+        merged_out["income"] = merged_out["amount"]
+
+    # (Optional) put income next to amount for readability (doesn't affect index writing)
+    front = ["project_id", "project", "date", "duration_hours", "amount", "income", "currency", "amount_gbp"]
+    rest = [c for c in merged_out.columns if c not in front]
+    merged_out = merged_out[front + rest]
+
     stats["final_joined"] = {
         "rows": int(len(merged_out)),
         "cols": int(merged_out.shape[1]),
