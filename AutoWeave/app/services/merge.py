@@ -113,14 +113,10 @@ async def trim_aggregate_and_join(
 
     entries["date"] = start_d
     entries.loc[entries["date"].isna(), "date"] = end_d
-
-    # NEW RULE: Drop rows where both start_time and end_time were missing/unparseable
-    entries = entries.dropna(subset=["date"])
-
     # Aggregate duration_hours by project_id, project_name, date
     time_agg = (
         entries
-        .groupby(["project_id", "project_name", "date"], as_index=False)
+        .groupby(["project_id", "project_name", "date"], as_index=False, dropna=False)
         .agg(duration_hours=("duration_hours", "sum"))
     )
 
@@ -152,7 +148,7 @@ async def trim_aggregate_and_join(
 
     income_agg = (
         incomes
-        .groupby(["project_id", "project_name", "date"], as_index=False)
+        .groupby(["project_id", "project_name", "date"], as_index=False, dropna=False)
         .agg(
             amount=("amount", "sum"),
             amount_gbp=("amount_gbp", "sum"),
@@ -198,30 +194,13 @@ async def trim_aggregate_and_join(
     merged = merged.drop_duplicates()
 
     merged = _ensure_final_cols(merged)
-
-    # ---- Add frontend-friendly aliases (minimal change) ----
-    merged_out = merged.copy()
-    merged_out["project"] = merged_out["project_name"]
-
-    # Use GBP if available, else amount
-    if "amount_gbp" in merged_out.columns:
-        merged_out["income"] = merged_out["amount_gbp"]
-    else:
-        merged_out["income"] = merged_out["amount"]
-
-    # Put expected columns first (keep existing cols after)
-    front_cols = ["date", "project", "income", "duration_hours"]
-    rest_cols = [c for c in merged_out.columns if c not in front_cols]
-    merged_out = merged_out[front_cols + rest_cols]
-
     stats["final_joined"] = {
-        "rows": int(len(merged_out)),
-        "cols": int(merged_out.shape[1]),
+        "rows": int(len(merged)),
+        "cols": int(merged.shape[1]),
     }
-
     return {
         "mode": "trim_agg_full_join_dedup",
         "stats": stats,
         "preview_csv": _preview(merged_out, 10),
-        "download_csv": merged_out.to_csv(index=False),
+        "download_csv": merged.to_csv(index=False),
     }
