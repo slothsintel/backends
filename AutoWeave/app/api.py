@@ -2,21 +2,18 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request, File, UploadFile, Query
-from .services.merge import trim_aggregate_and_join
+from fastapi import APIRouter, Depends, HTTPException, File, UploadFile
 from fastapi.security import OAuth2PasswordBearer
-from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.orm import Session
 
+from .services.merge import trim_aggregate_and_join
 from .db import get_db
 from .models import OwUser
-from .auth import hash_password, verify_password
-from .mailer import send_email
 from .auth import create_access_token, safe_decode_sub, hash_password, verify_password
+from .mailer import send_email
 from .delete_account import router as delete_account_router
 
 router = APIRouter()
@@ -25,36 +22,12 @@ router.include_router(delete_account_router)
 # =========================
 # JWT / Security
 # =========================
-JWT_SECRET = os.getenv("JWT_SECRET", "").strip()
-JWT_ALG = os.getenv("JWT_ALG", "HS256").strip()
-JWT_EXPIRES_MIN = int(os.getenv("JWT_EXPIRES_MIN", "60"))
-
-if not JWT_SECRET:
-    # Hard fail so you don't silently mint unverifiable tokens.
-    raise RuntimeError("JWT_SECRET is not set")
-
+# Keep OAuth2PasswordBearer for compatibility (even if not currently used directly here).
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login", auto_error=False)
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def create_access_token(sub: str) -> str:
-    expire = utcnow() + timedelta(minutes=JWT_EXPIRES_MIN)
-    payload = {"sub": sub, "exp": expire}
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
-
-
-def safe_decode_sub(token: str) -> Optional[str]:
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
-        sub = payload.get("sub")
-        if not sub:
-            return None
-        return str(sub)
-    except JWTError:
-        return None
 
 
 def build_frontend_url(path: str) -> str:
@@ -203,9 +176,9 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
 def login(payload: LoginRequest, db: Session = Depends(get_db)):
     email = payload.email.lower().strip()
     user = (
-    db.query(OwUser)
-    .filter(OwUser.email == email, OwUser.is_deleted == False)  # noqa: E712
-    .first()
+        db.query(OwUser)
+        .filter(OwUser.email == email, OwUser.is_deleted == False)  # noqa: E712
+        .first()
     )
 
     if not user:
@@ -301,6 +274,7 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db))
     db.commit()
     return {"ok": True}
 
+
 @router.post("/merge/autotrac")
 async def merge_autotrac(
     time_entries_csv: UploadFile = File(...),
@@ -314,22 +288,3 @@ async def merge_autotrac(
       - projects_csv (optional)
     """
     return await trim_aggregate_and_join(time_entries_csv, incomes_csv, projects_csv)
-
-@router.get("/auth/verify")
-def verify_get(token: str = Query(...), db: Session = Depends(get_db)):
-    # Reuse the same logic as POST
-    sub = safe_decode_sub(token)
-    if not sub:
-        raise HTTPException(status_code=400, detail="Invalid or expired token")
-
-    email = sub.lower().strip()
-    user = db.query(OwUser).filter(OwUser.email == email).first()
-    if not user:
-        raise HTTPException(status_code=400, detail="Invalid token")
-
-    user.is_verified = True
-    user.updated_at = utcnow()
-    db.add(user)
-    db.commit()
-
-    return {"ok": True}

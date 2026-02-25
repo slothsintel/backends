@@ -49,6 +49,12 @@ def ensure_schema():
         conn.execute(text("ALTER TABLE ow_users ADD COLUMN IF NOT EXISTS reset_hash TEXT"))
         conn.execute(text("ALTER TABLE ow_users ADD COLUMN IF NOT EXISTS reset_expires_at TIMESTAMPTZ"))
 
+        # ✅ Add missing columns used by delete/welcome flows (required by models.py + API filters)
+        conn.execute(text("ALTER TABLE ow_users ADD COLUMN IF NOT EXISTS welcome_sent BOOLEAN NOT NULL DEFAULT FALSE"))
+        conn.execute(text("ALTER TABLE ow_users ADD COLUMN IF NOT EXISTS welcome_sent_at TIMESTAMPTZ"))
+        conn.execute(text("ALTER TABLE ow_users ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT FALSE"))
+        conn.execute(text("ALTER TABLE ow_users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ"))
+
         # updated_at auto-maintain (optional)
         conn.execute(text("ALTER TABLE ow_users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"))
 

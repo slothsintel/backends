@@ -1,11 +1,10 @@
 # app/models.py
 from datetime import datetime, timezone
-
-from zmq import NULL
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey
+from sqlalchemy import Column, String, Boolean, DateTime, ForeignKey
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
+from sqlalchemy.sql import text
 from .db import Base
-from sqlalchemy import Boolean, DateTime
 
 
 def utcnow():
@@ -15,12 +14,23 @@ def utcnow():
 class OwUser(Base):
     __tablename__ = "ow_users"
 
-    id = Column(Integer, primary_key=True, index=True)
+    # DB column is uuid with default gen_random_uuid()
+    id = Column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+
     email = Column(String, unique=True, index=True, nullable=False)
     password_hash = Column(String, nullable=False)
 
-    # IMPORTANT: keep name as is_verified to match what your API currently expects
-    is_verified = Column(Boolean, nullable=False, default=False)
+    # Map API's "is_verified" attribute to DB column "is_email_verified"
+    is_verified = Column(
+        "is_email_verified",
+        Boolean,
+        nullable=False,
+        server_default=text("false"),
+    )
 
     verify_hash = Column(String, nullable=True)
     verify_expires_at = Column(DateTime(timezone=True), nullable=True)
@@ -42,7 +52,13 @@ class OwPasswordReset(Base):
     __tablename__ = "ow_password_resets"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("ow_users.id", ondelete="CASCADE"), nullable=False)
+
+    # Match UUID user id
+    user_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("ow_users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
 
     token_hash = Column(String, nullable=False)
     expires_at = Column(DateTime(timezone=True), nullable=False)
