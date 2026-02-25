@@ -60,11 +60,11 @@ def _to_date(series: pd.Series) -> pd.Series:
     # common “CSV mess” cleanup
     s = s.str.replace(r",+$", "", regex=True)
 
-    dt = pd.to_datetime(s, errors="coerce", utc=True)
+    dt = pd.to_datetime(s, errors="coerce", utc=True, format="mixed")
 
     # fallback: try again without utc if some values failed
     if dt.isna().any():
-        dt2 = pd.to_datetime(s, errors="coerce")
+        dt2 = pd.to_datetime(s, errors="coerce", format="mixed")
         # fill only the missing ones
         dt = dt.fillna(dt2)
 
