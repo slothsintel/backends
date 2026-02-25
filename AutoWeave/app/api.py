@@ -5,7 +5,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, File, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Request, File, UploadFile, Query
 from .services.merge import trim_aggregate_and_join
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
@@ -314,3 +314,22 @@ async def merge_autotrac(
       - projects_csv (optional)
     """
     return await trim_aggregate_and_join(time_entries_csv, incomes_csv, projects_csv)
+
+@router.get("/auth/verify")
+def verify_get(token: str = Query(...), db: Session = Depends(get_db)):
+    # Reuse the same logic as POST
+    sub = safe_decode_sub(token)
+    if not sub:
+        raise HTTPException(status_code=400, detail="Invalid or expired token")
+
+    email = sub.lower().strip()
+    user = db.query(OwUser).filter(OwUser.email == email).first()
+    if not user:
+        raise HTTPException(status_code=400, detail="Invalid token")
+
+    user.is_verified = True
+    user.updated_at = utcnow()
+    db.add(user)
+    db.commit()
+
+    return {"ok": True}
