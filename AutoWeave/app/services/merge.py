@@ -191,16 +191,16 @@ async def trim_aggregate_and_join(
                           how="outer")
 
     # NEW RULE: Deduplicate final rows
-    merged = merged.drop_duplicates()
+    merged_out = merged.drop_duplicates()
 
-    merged = _ensure_final_cols(merged)
+    merged_out = _ensure_final_cols(merged_out)
     stats["final_joined"] = {
-        "rows": int(len(merged)),
-        "cols": int(merged.shape[1]),
+        "rows": int(len(merged_out)),
+        "cols": int(merged_out.shape[1]),
     }
     return {
         "mode": "trim_agg_full_join_dedup",
         "stats": stats,
         "preview_csv": _preview(merged_out, 10),
-        "download_csv": merged.to_csv(index=False),
+        "download_csv": merged_out.to_csv(index=False),
     }
