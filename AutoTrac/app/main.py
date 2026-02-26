@@ -285,30 +285,6 @@ def forgot_password(body: schemas.ForgotPasswordRequest, db: Session = Depends(g
 
     return {"ok": True}
 
-@app.post("/auth/forgot-password", response_model=schemas.OkResult)
-def forgot_password(body: schemas.ForgotPasswordRequest, db: Session = Depends(get_db)):
-    email = body.email.strip().lower()
-    u = db.query(models.User).filter(models.User.email == email).first()
-
-    # Always return ok (prevents revealing whether an email exists)
-    if not u:
-        return {"ok": True}
-
-    token = make_reset_token()
-    expires = datetime.utcnow() + timedelta(hours=RESET_TTL_HOURS)
-
-    u.reset_token = token
-    u.reset_token_expires_at = expires
-    db.commit()
-
-    try:
-        send_reset_email(email, token)
-        print(f"[email] reset email sent to {email}")
-    except Exception as e:
-        print(f"[email] failed to send reset email to {email}: {e}")
-
-    return {"ok": True}
-
 @app.post("/auth/reset-password", response_model=schemas.OkResult)
 def reset_password(body: schemas.ResetPasswordRequest, db: Session = Depends(get_db)):
     if len(body.new_password) < 8:
@@ -615,3 +591,24 @@ def export_project_incomes_csv(
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+@app.delete("/auth/me", response_model=schemas.OkResult)
+def delete_me(
+    db: Session = Depends(get_db),
+    user: models.User = Depends(get_current_user),
+):
+    """
+    Permanently delete the currently authenticated user and all their data.
+    """
+    user_id = user.id
+
+    # Delete children first to avoid FK constraint errors (if cascades aren't set)
+    db.query(models.TimeEntry).filter(models.TimeEntry.user_id == user_id).delete(synchronize_session=False)
+    db.query(models.IncomeRecord).filter(models.IncomeRecord.user_id == user_id).delete(synchronize_session=False)
+    db.query(models.Project).filter(models.Project.user_id == user_id).delete(synchronize_session=False)
+
+    # Finally delete the user
+    db.query(models.User).filter(models.User.id == user_id).delete(synchronize_session=False)
+
+    db.commit()
+    return {"ok": True}
