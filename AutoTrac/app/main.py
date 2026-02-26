@@ -119,7 +119,7 @@ def send_reset_email(to_email: str, token: str) -> None:
         f"{link}\n\n"
         f"This link expires in {RESET_TTL_HOURS} hour(s).\n\n"
         "If you didn’t request this, you can ignore this email or report to us (mailto:info@slothsintel.com).\n"
-        "— Sloths Intel\n"
+        "— Sloths Intel Team\n"
     )
 
     with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as s:
@@ -174,7 +174,7 @@ def _send_verify_email(to_email: str, token: str) -> None:
         "Please confirm your email address by opening this link:\n"
         f"{link}\n\n"
         f"This link expires in {VERIFY_TTL_HOURS} hours.\n\n"
-        "— Sloths Intel\n"
+        "— Sloths Intel Team\n"
     )
 
     with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as s:
